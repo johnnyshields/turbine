@@ -32,6 +32,7 @@ pub struct IouringBufferPool<H> {
 }
 
 impl<H> IouringBufferPool<H> {
+    #[inline]
     fn mgr(&self) -> &ArenaManager {
         unsafe { &*self.manager.get() }
     }
@@ -39,16 +40,19 @@ impl<H> IouringBufferPool<H> {
     /// # Safety justification
     /// Pool is !Send (PhantomData<Rc<()>>), guaranteeing single-threaded access.
     /// No method holds a reference across a call to another method.
+    #[inline]
     #[allow(clippy::mut_from_ref)]
     fn mgr_mut(&self) -> &mut ArenaManager {
         unsafe { &mut *self.manager.get() }
     }
 
+    #[inline]
     fn reg(&self) -> &RingRegistration {
         unsafe { &*self.registration.get() }
     }
 
     /// See mgr_mut safety justification.
+    #[inline]
     #[allow(clippy::mut_from_ref)]
     fn reg_mut(&self) -> &mut RingRegistration {
         unsafe { &mut *self.registration.get() }
@@ -76,6 +80,7 @@ impl<H: BufferPinHook + EpochObserver> IouringBufferPool<H> {
     ///
     /// Returns `None` if the arena is full. The returned [`LeasedBuffer`] is
     /// `!Send` and must not leave the owning thread.
+    #[inline]
     pub fn lease(&self, len: usize) -> Option<LeasedBuffer> {
         let mgr = self.mgr();
         let arena = mgr.current_arena();

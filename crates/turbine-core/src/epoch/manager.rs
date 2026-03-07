@@ -156,6 +156,7 @@ impl ArenaManager {
     }
 
     /// Reference to the current writable arena.
+    #[inline]
     pub fn current_arena(&self) -> &Arena {
         self.arenas[self.write_idx.as_usize()]
             .as_ref()
@@ -163,16 +164,19 @@ impl ArenaManager {
     }
 
     /// Slab index of the current writable arena.
+    #[inline]
     pub fn current_arena_idx(&self) -> ArenaIdx {
         self.write_idx
     }
 
     /// Look up an arena by slab index.
+    #[inline]
     pub fn arena_at(&self, idx: ArenaIdx) -> Option<&Arena> {
         self.arenas.get(idx.as_usize()).and_then(|slot| slot.as_ref().map(|b| &**b))
     }
 
     /// Current epoch number.
+    #[inline]
     pub fn epoch(&self) -> u64 {
         self.epoch
     }

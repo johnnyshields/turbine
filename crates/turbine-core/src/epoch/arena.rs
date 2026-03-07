@@ -73,6 +73,7 @@ impl Arena {
     ///
     /// Returns `(pointer, buf_id)` or `None` if the arena is full.
     /// The pointer is valid for the lifetime of the arena.
+    #[inline]
     pub fn alloc(&self, len: usize) -> Option<(*mut u8, u32)> {
         let current = self.offset.get();
         let new_offset = current + len;
@@ -91,11 +92,13 @@ impl Arena {
     }
 
     /// Increment the lease count.
+    #[inline]
     pub fn acquire_lease(&self) {
         self.lease_count.set(self.lease_count.get() + 1);
     }
 
     /// Decrement the lease count.
+    #[inline]
     pub fn release_lease(&self) {
         let count = self.lease_count.get();
         debug_assert!(count > 0, "release_lease called with zero lease count");
@@ -103,11 +106,13 @@ impl Arena {
     }
 
     /// Current number of outstanding leases.
+    #[inline]
     pub fn lease_count(&self) -> usize {
         self.lease_count.get()
     }
 
     /// Bytes remaining in this arena.
+    #[inline]
     pub fn available(&self) -> usize {
         self.capacity - self.offset.get()
     }
@@ -118,11 +123,13 @@ impl Arena {
     }
 
     /// Bytes allocated so far.
+    #[inline]
     pub fn used(&self) -> usize {
         self.offset.get()
     }
 
     /// Current lifecycle state.
+    #[inline]
     pub fn state(&self) -> ArenaState {
         self.state.get()
     }
@@ -133,6 +140,7 @@ impl Arena {
     }
 
     /// The epoch this arena is associated with.
+    #[inline]
     pub fn epoch(&self) -> u64 {
         self.epoch.get()
     }
@@ -156,6 +164,7 @@ impl Arena {
 
     /// Hint to OS that unused pages can be reclaimed.
     /// Called when arena enters draining state.
+    #[cold]
     pub fn advise_free_unused(&self, page_size: usize) {
         let used = self.offset.get();
         let start = (used + page_size - 1) & !(page_size - 1); // align up
@@ -186,6 +195,7 @@ impl Arena {
 }
 
 impl Drop for Arena {
+    #[cold]
     fn drop(&mut self) {
         let count = self.lease_count.get();
         if count > 0 {

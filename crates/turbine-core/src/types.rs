@@ -3,10 +3,12 @@
 pub struct ArenaIdx(usize);
 
 impl ArenaIdx {
+    #[inline]
     pub fn new(idx: usize) -> Self {
         Self(idx)
     }
 
+    #[inline]
     pub fn as_usize(self) -> usize {
         self.0
     }
@@ -23,10 +25,12 @@ impl std::fmt::Display for ArenaIdx {
 pub struct SlotId(u16);
 
 impl SlotId {
+    #[inline]
     pub fn new(id: u16) -> Self {
         Self(id)
     }
 
+    #[inline]
     pub fn as_u16(self) -> u16 {
         self.0
     }

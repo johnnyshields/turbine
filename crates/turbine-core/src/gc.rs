@@ -35,11 +35,15 @@ pub trait EpochObserver {
 pub struct NoopHooks;
 
 impl BufferPinHook for NoopHooks {
+    #[inline]
     fn on_pin(&self, _epoch: u64, _buf_id: u32) {}
+    #[inline]
     fn on_release(&self, _epoch: u64, _buf_id: u32) {}
 }
 
 impl EpochObserver for NoopHooks {
+    #[inline]
     fn on_rotate(&self, _retired: u64, _active: u64) {}
+    #[inline]
     fn on_collect(&self, _epoch: u64) {}
 }

@@ -1,42 +1,44 @@
-use std::collections::HashMap;
-
 use crate::epoch::arena::Arena;
 use crate::error::{Result, TurbineError};
 use crate::{ArenaIdx, SlotId};
 
 /// Bitmap-based slot allocator for io_uring buffer registration slots.
 struct SlotAllocator {
-    slots: Vec<bool>, // true = allocated
+    bitmap: u64,
+    capacity: usize,
 }
 
 impl SlotAllocator {
     fn new(capacity: usize) -> Self {
+        assert!(capacity <= 64, "SlotAllocator supports at most 64 slots");
         Self {
-            slots: vec![false; capacity],
+            bitmap: 0,
+            capacity,
         }
     }
 
     fn alloc(&mut self) -> Option<SlotId> {
-        for (i, slot) in self.slots.iter_mut().enumerate() {
-            if !*slot {
-                *slot = true;
-                return Some(SlotId::new(i as u16));
-            }
+        let free = !self.bitmap;
+        if free == 0 {
+            return None;
         }
-        None
+        let bit = free.trailing_zeros() as usize;
+        if bit >= self.capacity {
+            return None;
+        }
+        self.bitmap |= 1 << bit;
+        Some(SlotId::new(bit as u16))
     }
 
     fn free(&mut self, slot: SlotId) {
-        let idx = slot.as_u16() as usize;
-        debug_assert!(idx < self.slots.len(), "slot index out of bounds");
-        debug_assert!(self.slots[idx], "freeing unallocated slot");
-        if idx < self.slots.len() {
-            self.slots[idx] = false;
-        }
+        let bit = slot.as_u16() as usize;
+        debug_assert!(bit < self.capacity, "slot index out of bounds");
+        debug_assert!(self.bitmap & (1 << bit) != 0, "freeing unallocated slot");
+        self.bitmap &= !(1 << bit);
     }
 
     fn capacity(&self) -> usize {
-        self.slots.len()
+        self.capacity
     }
 }
 
@@ -44,7 +46,7 @@ impl SlotAllocator {
 pub struct RingRegistration {
     registered: bool,
     slots: SlotAllocator,
-    arena_slot_map: HashMap<ArenaIdx, SlotId>, // slab_idx → io_uring slot
+    arena_slot_map: Vec<Option<SlotId>>, // slab_idx → io_uring slot
     generation: u64,
 }
 
@@ -53,8 +55,15 @@ impl RingRegistration {
         Self {
             registered: false,
             slots: SlotAllocator::new(registration_slots),
-            arena_slot_map: HashMap::new(),
+            arena_slot_map: Vec::new(),
             generation: 0,
+        }
+    }
+
+    fn ensure_arena_capacity(&mut self, idx: ArenaIdx) {
+        let needed = idx.as_usize() + 1;
+        if self.arena_slot_map.len() < needed {
+            self.arena_slot_map.resize(needed, None);
         }
     }
 
@@ -79,7 +88,8 @@ impl RingRegistration {
                 .slots
                 .alloc()
                 .ok_or(TurbineError::NoRegistrationSlot(slab_idx))?;
-            self.arena_slot_map.insert(slab_idx, slot);
+            self.ensure_arena_capacity(slab_idx);
+            self.arena_slot_map[slab_idx.as_usize()] = Some(slot);
             iovecs[slot.as_u16() as usize] = arena.as_iovec();
         }
 
@@ -117,22 +127,30 @@ impl RingRegistration {
             .slots
             .alloc()
             .ok_or(TurbineError::NoRegistrationSlot(slab_idx))?;
-        self.arena_slot_map.insert(slab_idx, slot);
+        self.ensure_arena_capacity(slab_idx);
+        self.arena_slot_map[slab_idx.as_usize()] = Some(slot);
         self.generation += 1;
         Ok(slot)
     }
 
     /// Remove an arena from the slot map.
     pub fn unregister_arena(&mut self, slab_idx: ArenaIdx) {
-        if let Some(slot) = self.arena_slot_map.remove(&slab_idx) {
+        if let Some(slot) = self
+            .arena_slot_map
+            .get(slab_idx.as_usize())
+            .copied()
+            .flatten()
+        {
+            self.arena_slot_map[slab_idx.as_usize()] = None;
             self.slots.free(slot);
             self.generation += 1;
         }
     }
 
     /// Look up the io_uring slot for a given arena slab index.
+    #[inline]
     pub fn slot_for_arena(&self, slab_idx: ArenaIdx) -> Option<SlotId> {
-        self.arena_slot_map.get(&slab_idx).copied()
+        self.arena_slot_map.get(slab_idx.as_usize()).copied().flatten()
     }
 
     pub fn is_registered(&self) -> bool {
