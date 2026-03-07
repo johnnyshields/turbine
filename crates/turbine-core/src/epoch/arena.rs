@@ -40,7 +40,7 @@ impl Arena {
     /// Create a new arena backed by an anonymous mmap of `size` bytes.
     ///
     /// `size` must be a multiple of `page_size` (typically 4096).
-    pub fn new(size: usize) -> Result<Self> {
+    pub(crate) fn new(size: usize) -> Result<Self> {
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -84,7 +84,8 @@ impl Arena {
         self.offset.set(new_offset);
 
         let buf_id = self.next_buf_id.get();
-        self.next_buf_id.set(buf_id + 1);
+        let next = buf_id.checked_add(1)?;
+        self.next_buf_id.set(next);
 
         let ptr = unsafe { self.base.as_ptr().add(current) };
         Some((ptr, buf_id))

@@ -50,6 +50,7 @@ impl RingRegistration {
     /// Map an arena index to the io_uring buf_index.
     /// Since each arena is registered as one iovec entry, the mapping is 1:1.
     pub fn arena_to_buf_index(arena_idx: usize) -> u16 {
+        assert!(arena_idx <= u16::MAX as usize, "arena index {arena_idx} exceeds u16::MAX");
         arena_idx as u16
     }
 }

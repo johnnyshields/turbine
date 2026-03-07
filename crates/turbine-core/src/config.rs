@@ -30,6 +30,12 @@ impl PoolConfig {
                 "arena_count must be >= 2".into(),
             ));
         }
+        if self.page_size == 0 || (self.page_size & (self.page_size - 1)) != 0 {
+            return Err(TurbineError::InvalidConfig(format!(
+                "page_size ({}) must be a power of two",
+                self.page_size
+            )));
+        }
         if self.arena_size == 0 {
             return Err(TurbineError::InvalidConfig(
                 "arena_size must be > 0".into(),
@@ -39,12 +45,6 @@ impl PoolConfig {
             return Err(TurbineError::InvalidConfig(format!(
                 "arena_size ({}) must be a multiple of page_size ({})",
                 self.arena_size, self.page_size
-            )));
-        }
-        if self.page_size == 0 || (self.page_size & (self.page_size - 1)) != 0 {
-            return Err(TurbineError::InvalidConfig(format!(
-                "page_size ({}) must be a power of two",
-                self.page_size
             )));
         }
         Ok(())
@@ -85,5 +85,53 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn arena_size_zero_rejected() {
+        let cfg = PoolConfig {
+            arena_size: 0,
+            arena_count: 2,
+            page_size: 4096,
+        };
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("arena_size"), "error should mention arena_size: {msg}");
+    }
+
+    #[test]
+    fn page_size_zero_rejected() {
+        let cfg = PoolConfig {
+            arena_size: 4096,
+            arena_count: 2,
+            page_size: 0,
+        };
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("page_size"), "error should mention page_size: {msg}");
+    }
+
+    #[test]
+    fn page_size_not_power_of_two_rejected() {
+        let cfg = PoolConfig {
+            arena_size: 6000,
+            arena_count: 2,
+            page_size: 6000,
+        };
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("power of two"), "error should mention power of two: {msg}");
+    }
+
+    #[test]
+    fn arena_count_one_rejected() {
+        let cfg = PoolConfig {
+            arena_size: 4096,
+            arena_count: 1,
+            page_size: 4096,
+        };
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("arena_count"), "error should mention arena_count: {msg}");
     }
 }

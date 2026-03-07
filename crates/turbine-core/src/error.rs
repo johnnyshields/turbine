@@ -29,3 +29,73 @@ pub enum TurbineError {
 }
 
 pub type Result<T> = std::result::Result<T, TurbineError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arena_full_display() {
+        let e = TurbineError::ArenaFull { requested: 1024, available: 512 };
+        let msg = format!("{e}");
+        assert!(msg.contains("1024"), "should contain requested bytes");
+        assert!(msg.contains("512"), "should contain available bytes");
+    }
+
+    #[test]
+    fn epoch_not_found_display() {
+        let e = TurbineError::EpochNotFound(42);
+        let msg = format!("{e}");
+        assert!(msg.contains("42"));
+        assert!(msg.contains("not found"));
+    }
+
+    #[test]
+    fn epoch_not_collectable_display() {
+        let e = TurbineError::EpochNotCollectable(7, 3);
+        let msg = format!("{e}");
+        assert!(msg.contains("7"));
+        assert!(msg.contains("3"));
+        assert!(msg.contains("leases"));
+    }
+
+    #[test]
+    fn leaked_leases_display() {
+        let e = TurbineError::LeakedLeases(5);
+        let msg = format!("{e}");
+        assert!(msg.contains("5"));
+        assert!(msg.contains("leases"));
+    }
+
+    #[test]
+    fn mmap_display() {
+        let e = TurbineError::Mmap(std::io::Error::new(std::io::ErrorKind::Other, "oom"));
+        let msg = format!("{e}");
+        assert!(msg.contains("mmap"));
+        assert!(msg.contains("oom"));
+    }
+
+    #[test]
+    fn munmap_display() {
+        let e = TurbineError::Munmap(std::io::Error::new(std::io::ErrorKind::Other, "bad"));
+        let msg = format!("{e}");
+        assert!(msg.contains("munmap"));
+        assert!(msg.contains("bad"));
+    }
+
+    #[test]
+    fn registration_display() {
+        let e = TurbineError::Registration(std::io::Error::new(std::io::ErrorKind::Other, "fail"));
+        let msg = format!("{e}");
+        assert!(msg.contains("registration"));
+        assert!(msg.contains("fail"));
+    }
+
+    #[test]
+    fn invalid_config_display() {
+        let e = TurbineError::InvalidConfig("too small".into());
+        let msg = format!("{e}");
+        assert!(msg.contains("invalid"));
+        assert!(msg.contains("too small"));
+    }
+}

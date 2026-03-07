@@ -5,6 +5,7 @@ use crossbeam_channel::Sender;
 pub struct ReturnedBuffer {
     pub epoch: u64,
     pub arena_idx: usize,
+    pub buf_id: u32,
 }
 
 /// A clonable, `Send + Sync` handle for returning buffers from other threads.
@@ -32,6 +33,7 @@ pub struct SendableBuffer {
     len: usize,
     epoch: u64,
     arena_idx: usize,
+    buf_id: u32,
     sender: Sender<ReturnedBuffer>,
 }
 
@@ -47,9 +49,10 @@ impl SendableBuffer {
         len: usize,
         epoch: u64,
         arena_idx: usize,
+        buf_id: u32,
         sender: Sender<ReturnedBuffer>,
     ) -> Self {
-        Self { ptr, len, epoch, arena_idx, sender }
+        Self { ptr, len, epoch, arena_idx, buf_id, sender }
     }
 
     /// Read the buffer contents.
@@ -78,11 +81,11 @@ impl Drop for SendableBuffer {
         let _ = self.sender.send(ReturnedBuffer {
             epoch: self.epoch,
             arena_idx: self.arena_idx,
+            buf_id: self.buf_id,
         });
     }
 }
 
-// Compile-time assertions for trait bounds.
 // Compile-time assertions for trait bounds.
 fn _assert_sendable_buffer_is_send<T: Send>() {}
 fn _assert_transfer_handle_is_send<T: Send + Sync>() {}
@@ -108,6 +111,7 @@ mod tests {
                 data.len(),
                 42,
                 7,
+                0,
                 tx,
             );
             // buf is dropped here
@@ -126,8 +130,8 @@ mod tests {
 
         // Both handles should reference the same channel.
         let data = [0u8; 1];
-        let _buf = SendableBuffer::new(data.as_ptr(), 1, 1, 0, handle.sender().clone());
-        let _buf2 = SendableBuffer::new(data.as_ptr(), 1, 2, 1, handle2.sender().clone());
+        let _buf = SendableBuffer::new(data.as_ptr(), 1, 1, 0, 0, handle.sender().clone());
+        let _buf2 = SendableBuffer::new(data.as_ptr(), 1, 2, 1, 0, handle2.sender().clone());
 
         drop(_buf);
         drop(_buf2);
@@ -143,6 +147,7 @@ mod tests {
         let rb = ReturnedBuffer {
             epoch: 99,
             arena_idx: 3,
+            buf_id: 5,
         };
         assert_eq!(rb.epoch, 99);
         assert_eq!(rb.arena_idx, 3);
