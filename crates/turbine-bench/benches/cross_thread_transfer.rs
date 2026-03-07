@@ -40,7 +40,6 @@ fn bench_cross_thread_turbine(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &sz| {
             let pool = IouringBufferPool::new(config.clone(), NoopHooks).unwrap();
-            let handle = pool.transfer_handle();
 
             let (tx, rx): (
                 Sender<WorkItem<turbine_core::transfer::handle::SendableBuffer>>,
@@ -52,7 +51,7 @@ fn bench_cross_thread_turbine(c: &mut Criterion) {
                     match work {
                         WorkItem::Transfer(sendable) => {
                             black_box(&sendable);
-                            drop(sendable); // sends ReturnedBuffer through channel
+                            drop(sendable);
                         }
                         WorkItem::Shutdown => break,
                     }
@@ -63,25 +62,19 @@ fn bench_cross_thread_turbine(c: &mut Criterion) {
                 let buf = match pool.lease(sz) {
                     Some(buf) => buf,
                     None => {
-                        pool.drain_returns();
+                        pool.collect();
                         pool.rotate().unwrap();
                         pool.collect();
                         pool.lease(sz).expect("fresh arena should have space")
                     }
                 };
-                let sendable = buf.into_sendable(&handle);
+                let sendable = buf.into_sendable();
                 tx.send(WorkItem::Transfer(sendable)).unwrap();
-
-                // Periodically drain returns.
-                pool.drain_returns();
             });
 
             // Shutdown worker.
             tx.send(WorkItem::Shutdown).unwrap();
             worker.join().unwrap();
-
-            // Final drain.
-            pool.drain_returns();
         });
     }
     group.finish();
@@ -100,7 +93,6 @@ fn bench_cross_thread_turbine_batch(c: &mut Criterion) {
         group.throughput(Throughput::Bytes((size * BATCH_SIZE) as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &sz| {
             let pool = IouringBufferPool::new(config.clone(), NoopHooks).unwrap();
-            let handle = pool.transfer_handle();
 
             let (tx, rx): (Sender<Vec<turbine_core::transfer::handle::SendableBuffer>>, Receiver<Vec<turbine_core::transfer::handle::SendableBuffer>>) = bounded(8);
 
@@ -122,22 +114,20 @@ fn bench_cross_thread_turbine_batch(c: &mut Criterion) {
                     let buf = match pool.lease(sz) {
                         Some(buf) => buf,
                         None => {
-                            pool.drain_returns();
+                            pool.collect();
                             pool.rotate().unwrap();
                             pool.collect();
                             pool.lease(sz).expect("fresh arena should have space")
                         }
                     };
-                    batch.push(buf.into_sendable(&handle));
+                    batch.push(buf.into_sendable());
                 }
                 tx.send(batch).unwrap();
-                pool.drain_returns();
             });
 
             // Shutdown worker.
             tx.send(Vec::new()).unwrap();
             worker.join().unwrap();
-            pool.drain_returns();
         });
     }
     group.finish();

@@ -8,5 +8,4 @@ license.workspace = true
 io-uring = "0.7"
 thiserror = "2"
 tracing = "0.1"
-crossbeam-channel = "0.5"
 libc = "0.2"

@@ -1,65 +1,22 @@
-use crossbeam_channel::Sender;
-
-use crate::ArenaIdx;
-
-/// Message sent back through the channel when a [`SendableBuffer`] is dropped.
-#[derive(Debug, Clone, Copy)]
-pub struct ReturnedBuffer {
-    pub epoch: u64,
-    pub arena_idx: ArenaIdx,
-    pub buf_id: u32,
-}
-
-/// A clonable, `Send + Sync` handle for returning buffers from other threads.
-#[derive(Debug, Clone)]
-pub struct TransferHandle {
-    sender: Sender<ReturnedBuffer>,
-}
-
-impl TransferHandle {
-    pub fn new(sender: Sender<ReturnedBuffer>) -> Self {
-        Self { sender }
-    }
-
-    #[inline]
-    pub fn sender(&self) -> &Sender<ReturnedBuffer> {
-        &self.sender
-    }
-
-    /// Raw pointer to the sender, for use by `SendableBuffer` to avoid
-    /// cloning the `Arc`-backed `Sender` on every `into_sendable()`.
-    #[inline]
-    pub fn sender_ptr(&self) -> *const Sender<ReturnedBuffer> {
-        &self.sender as *const Sender<ReturnedBuffer>
-    }
-}
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A buffer that can be sent across threads.
 ///
-/// When dropped, sends a [`ReturnedBuffer`] message through the channel so
-/// the owning thread can decrement the arena's lease count.
-///
-/// Stores a raw pointer to the `TransferHandle`'s `Sender` instead of an
-/// owned clone, avoiding 2 atomic ops (Arc clone + drop) per buffer transfer.
+/// When dropped, atomically increments the arena's `remote_returns` counter
+/// so the owning thread sees the lease as released on next `collect()`.
 pub struct SendableBuffer {
     ptr: *const u8,
     len: usize,
     epoch: u64,
-    arena_idx: ArenaIdx,
-    buf_id: u32,
-    sender: *const Sender<ReturnedBuffer>,
+    remote_returns: *const AtomicUsize,
 }
 
-// SAFETY: The arena backing this buffer cannot be collected while
-// lease_count > 0. The owning thread only decrements lease_count
-// after receiving the ReturnedBuffer through the channel, which
-// happens after this SendableBuffer is dropped.
-//
-// The raw `sender` pointer is valid for the lifetime of any SendableBuffer
-// because the TransferHandle (which owns the Sender) is owned by the
-// IouringBufferPool, which is !Send and outlives all SendableBuffers.
-// If the channel is disconnected (pool dropped), send() returns Err
-// which is silently ignored — same as before.
+// SAFETY: `ptr` points into arena mmap memory that remains valid while
+// outstanding leases > 0. `remote_returns` points into `Box<Arena>` which
+// provides address stability, and the arena cannot be freed while
+// outstanding leases exist (a live SendableBuffer means its fetch_add
+// hasn't fired yet, so outstanding > 0). The AtomicUsize is designed
+// for cross-thread access.
 unsafe impl Send for SendableBuffer {}
 
 impl SendableBuffer {
@@ -68,11 +25,9 @@ impl SendableBuffer {
         ptr: *const u8,
         len: usize,
         epoch: u64,
-        arena_idx: ArenaIdx,
-        buf_id: u32,
-        sender: *const Sender<ReturnedBuffer>,
+        remote_returns: *const AtomicUsize,
     ) -> Self {
-        Self { ptr, len, epoch, arena_idx, buf_id, sender }
+        Self { ptr, len, epoch, remote_returns }
     }
 
     /// Read the buffer contents.
@@ -103,86 +58,70 @@ impl SendableBuffer {
 impl Drop for SendableBuffer {
     #[inline]
     fn drop(&mut self) {
-        // SAFETY: sender pointer is valid — see unsafe impl Send comment above.
-        let _ = unsafe { &*self.sender }.send(ReturnedBuffer {
-            epoch: self.epoch,
-            arena_idx: self.arena_idx,
-            buf_id: self.buf_id,
-        });
+        // SAFETY: remote_returns points into Box<Arena> with stable address.
+        // Arena cannot be freed while outstanding leases > 0, and this
+        // SendableBuffer represents an outstanding lease until this fetch_add.
+        unsafe {
+            (*self.remote_returns).fetch_add(1, Ordering::Release);
+        }
     }
 }
 
-// Compile-time assertions for trait bounds.
+// Compile-time assertion for trait bounds.
 fn _assert_sendable_buffer_is_send<T: Send>() {}
-fn _assert_transfer_handle_is_send<T: Send + Sync>() {}
 #[allow(dead_code)]
 const _: () = {
     let _ = _assert_sendable_buffer_is_send::<SendableBuffer>;
-    let _ = _assert_transfer_handle_is_send::<TransferHandle>;
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossbeam_channel::unbounded;
+    use crate::epoch::arena::{Arena, ArenaState};
 
     #[test]
-    fn sendable_buffer_drop_sends_returned_buffer() {
-        let (tx, rx) = unbounded();
-        let handle = TransferHandle::new(tx);
-        let data = [1u8, 2, 3, 4];
+    fn sendable_buffer_drop_decrements_via_atomic() {
+        let arena = Arena::new(4096).unwrap();
+        arena.set_state(ArenaState::Writable);
+        arena.set_epoch(1);
+
+        let (ptr, _buf_id) = arena.alloc(64).unwrap();
+        arena.acquire_lease();
+        assert_eq!(arena.lease_count(), 1);
 
         {
             let _buf = SendableBuffer::new(
-                data.as_ptr(),
-                data.len(),
-                42,
-                ArenaIdx::new(7),
-                0,
-                handle.sender_ptr(),
+                ptr,
+                64,
+                1,
+                arena.remote_returns_ptr(),
             );
-            // buf is dropped here
+            // lease still held
+            assert_eq!(arena.lease_count(), 1);
         }
-
-        let returned = rx.try_recv().expect("should receive ReturnedBuffer on drop");
-        assert_eq!(returned.epoch, 42);
-        assert_eq!(returned.arena_idx, ArenaIdx::new(7));
+        // After SendableBuffer drop, remote_returns incremented.
+        assert_eq!(arena.lease_count(), 0);
     }
 
     #[test]
-    fn transfer_handle_clone_works() {
-        let (tx, _rx) = unbounded();
-        let handle = TransferHandle::new(tx);
-        let handle2 = handle.clone();
+    fn multiple_sendable_buffers_decrement() {
+        let arena = Arena::new(4096).unwrap();
+        arena.set_state(ArenaState::Writable);
+        arena.set_epoch(1);
 
-        // Both handles should reference the same channel.
-        let data = [0u8; 1];
-        let _buf = SendableBuffer::new(data.as_ptr(), 1, 1, ArenaIdx::new(0), 0, handle.sender_ptr());
-        let _buf2 = SendableBuffer::new(data.as_ptr(), 1, 2, ArenaIdx::new(1), 0, handle2.sender_ptr());
+        let (p1, _) = arena.alloc(32).unwrap();
+        let (p2, _) = arena.alloc(32).unwrap();
+        arena.acquire_lease();
+        arena.acquire_lease();
+        assert_eq!(arena.lease_count(), 2);
 
-        drop(_buf);
-        drop(_buf2);
+        let b1 = SendableBuffer::new(p1, 32, 1, arena.remote_returns_ptr());
+        let b2 = SendableBuffer::new(p2, 32, 1, arena.remote_returns_ptr());
 
-        let r1 = _rx.try_recv().unwrap();
-        let r2 = _rx.try_recv().unwrap();
-        assert_eq!(r1.epoch, 1);
-        assert_eq!(r2.epoch, 2);
-    }
+        drop(b1);
+        assert_eq!(arena.lease_count(), 1);
 
-    #[test]
-    fn returned_buffer_fields_correct() {
-        let rb = ReturnedBuffer {
-            epoch: 99,
-            arena_idx: ArenaIdx::new(3),
-            buf_id: 5,
-        };
-        assert_eq!(rb.epoch, 99);
-        assert_eq!(rb.arena_idx, ArenaIdx::new(3));
-
-        // Clone and Copy work.
-        let rb2 = rb;
-        let rb3 = rb;
-        assert_eq!(rb2.epoch, rb3.epoch);
-        assert_eq!(rb2.arena_idx, rb3.arena_idx);
+        drop(b2);
+        assert_eq!(arena.lease_count(), 0);
     }
 }

@@ -14,12 +14,12 @@ lore/             # Implementation notes and research documents
 ## Key Modules (turbine-core)
 
 - `types.rs` — `ArenaIdx`, `SlotId`: newtype wrappers for type-safe arena slab indices and io_uring slot IDs
-- `buffer/pool.rs` — `IouringBufferPool`: main API, owns ArenaManager + channel, UnsafeCell interior mutability
+- `buffer/pool.rs` — `IouringBufferPool`: main API, owns ArenaManager, UnsafeCell interior mutability
 - `buffer/leased.rs` — `LeasedBuffer`: !Send buffer with arena lease, `SlotId` for io_uring, `into_sendable()` for cross-thread
 - `buffer/pinned.rs` — `PinnedWrite`: borrow guard for io_uring submission, `buf_index()` returns `SlotId`
 - `epoch/manager.rs` — `ArenaManager`: slab-based arena management with drain queue and free pool, auto-collect on rotate
-- `epoch/arena.rs` — `Arena`: mmap'd bump allocator, lease counting via `Cell<usize>`, `advise_free_unused()` for madvise (warns on failure)
-- `transfer/handle.rs` — `TransferHandle` + `SendableBuffer`: cross-thread buffer transfer
+- `epoch/arena.rs` — `Arena`: mmap'd bump allocator, lease counting via `Cell<usize>` + `AtomicUsize` (split counter for cross-thread returns), `advise_free_unused()` for madvise (warns on failure)
+- `transfer/handle.rs` — `SendableBuffer`: cross-thread buffer transfer via atomic lease release
 - `ring/registration.rs` — `RingRegistration`: slot allocator + arena-to-slot mapping for io_uring
 - `config.rs` — `PoolConfig`: arena size, initial count, max free/total arenas, registration slots, page size
 - `gc.rs` — `BufferPinHook` + `EpochObserver` traits (with arena alloc/free/sweep hooks), `NoopHooks`
@@ -42,14 +42,14 @@ These are load-bearing and must not be weakened:
 4. `LeasedBuffer` and `IouringBufferPool` are `!Send` (enforced via `PhantomData<Rc<()>>`)
 5. `SendableBuffer::new()` is `pub(crate)` — must go through `into_sendable()`
 6. `into_sendable()` uses `ManuallyDrop` to transfer lease ownership without double-decrement
-7. `drain_returns()` uses `ArenaIdx` (not epoch scan) with epoch sanity check
-8. Arena `Drop` has `debug_assert` for leaked leases
-9. Arenas stored as `Box<Arena>` in slab — pointer stability guaranteed across Vec growth
-10. `ArenaIdx` and `SlotId` newtypes prevent mixing arena indices with slot IDs
+7. Arena `Drop` has `debug_assert` for leaked leases
+8. Arenas stored as `Box<Arena>` in slab — pointer stability guaranteed across Vec growth
+9. `ArenaIdx` and `SlotId` newtypes prevent mixing arena indices with slot IDs
+10. `SendableBuffer` stores `*const AtomicUsize` pointing to arena's `remote_returns` — valid because `Box<Arena>` provides address stability and arena can't be freed while outstanding leases exist
 
 ## Conventions
 
-- No atomics — all arena state uses `Cell<usize>` (thread-local assumption)
+- Atomics only for `Arena::remote_returns` (cross-thread lease release); all other arena state uses `Cell` (thread-local assumption)
 - Epoch lifecycle: Writable → Retired → Collected → recycled
 - Tests use `NoopHooks` and `PoolConfig { arena_size: 4096, initial_arenas: 3, ..defaults }`
 - Arena minimum count is 1 (one writable); draining arenas accumulate in drain queue

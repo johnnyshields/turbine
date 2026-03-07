@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use crate::buffer::pinned::PinnedWrite;
 use crate::epoch::arena::Arena;
-use crate::transfer::handle::{SendableBuffer, TransferHandle};
+use crate::transfer::handle::SendableBuffer;
 use crate::{ArenaIdx, SlotId};
 
 /// A leased buffer from an epoch arena. Not `Send` — must stay on the
@@ -108,18 +108,18 @@ impl LeasedBuffer {
     /// Convert this leased buffer into a [`SendableBuffer`] that can cross thread boundaries.
     ///
     /// Consumes `self` **without** calling `Drop`, so the arena lease stays alive.
-    /// The lease is transferred to the `SendableBuffer`; when it drops, a
-    /// `ReturnedBuffer` message is sent through the channel for `drain_returns()`.
+    /// The lease is transferred to the `SendableBuffer`; when it drops, the
+    /// arena's `remote_returns` counter is atomically incremented.
     #[inline]
-    pub fn into_sendable(self, handle: &TransferHandle) -> SendableBuffer {
+    pub fn into_sendable(self) -> SendableBuffer {
         let me = std::mem::ManuallyDrop::new(self);
+        // SAFETY: arena pointer is valid while this lease exists.
+        let remote_returns_ptr = unsafe { (*me.arena).remote_returns_ptr() };
         SendableBuffer::new(
             me.ptr,
             me.len,
             me.epoch,
-            me.arena_idx,
-            me.buf_id,
-            handle.sender_ptr(),
+            remote_returns_ptr,
         )
     }
 
@@ -245,9 +245,6 @@ mod tests {
 
     #[test]
     fn into_sendable_keeps_lease_alive() {
-        use crossbeam_channel::unbounded;
-        use crate::transfer::handle::TransferHandle;
-
         let arena = Arena::new(4096).unwrap();
         arena.set_state(ArenaState::Writable);
         arena.set_epoch(1);
@@ -257,23 +254,12 @@ mod tests {
 
         let buf = unsafe { LeasedBuffer::new(ptr, 64, 1, buf_id, SlotId::new(0), &arena as *const Arena, ArenaIdx::new(0)) };
 
-        let (tx, rx) = unbounded();
-        let handle = TransferHandle::new(tx);
-
         // into_sendable consumes the LeasedBuffer without decrementing lease_count.
-        let sendable = buf.into_sendable(&handle);
+        let sendable = buf.into_sendable();
         assert_eq!(arena.lease_count(), 1, "lease must stay alive after into_sendable");
 
-        // Drop the SendableBuffer — sends ReturnedBuffer through channel.
+        // Drop the SendableBuffer — atomically decrements remote_returns.
         drop(sendable);
-
-        let returned = rx.try_recv().expect("should receive ReturnedBuffer on drop");
-        assert_eq!(returned.epoch, 1);
-        assert_eq!(returned.arena_idx, ArenaIdx::new(0));
-        assert_eq!(returned.buf_id, buf_id);
-
-        // Manually release the lease (normally drain_returns would do this).
-        arena.release_lease();
-        assert_eq!(arena.lease_count(), 0);
+        assert_eq!(arena.lease_count(), 0, "lease should be released after SendableBuffer drop");
     }
 }

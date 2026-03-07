@@ -2,21 +2,18 @@ use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
-
 use crate::buffer::leased::LeasedBuffer;
 use crate::config::PoolConfig;
 use crate::epoch::manager::ArenaManager;
 use crate::error::{Result, TurbineError};
 use crate::gc::{BufferPinHook, EpochObserver};
 use crate::ring::registration::RingRegistration;
-use crate::transfer::handle::{ReturnedBuffer, TransferHandle};
-use crate::{ArenaIdx, SlotId};
+use crate::SlotId;
 
 /// The main API for epoch-based io_uring buffer management.
 ///
-/// Owns an [`ArenaManager`] (slab of arenas with drain queue and free pool),
-/// a [`RingRegistration`], and a crossbeam channel for cross-thread buffer returns.
+/// Owns an [`ArenaManager`] (slab of arenas with drain queue and free pool)
+/// and a [`RingRegistration`].
 ///
 /// Uses `UnsafeCell` for interior mutability of the manager and registration.
 /// This is safe because the pool is `!Send` (enforced by `PhantomData<Rc<()>>`),
@@ -25,8 +22,6 @@ use crate::{ArenaIdx, SlotId};
 pub struct IouringBufferPool<H> {
     manager: UnsafeCell<ArenaManager>,
     registration: UnsafeCell<RingRegistration>,
-    sender: Sender<ReturnedBuffer>,
-    receiver: Receiver<ReturnedBuffer>,
     hooks: H,
     _not_send: PhantomData<Rc<()>>,
 }
@@ -64,13 +59,10 @@ impl<H: BufferPinHook + EpochObserver> IouringBufferPool<H> {
     pub fn new(config: PoolConfig, hooks: H) -> Result<Self> {
         let manager = ArenaManager::new(&config)?;
         let registration = RingRegistration::new(config.registration_slots);
-        let (sender, receiver) = unbounded();
 
         Ok(Self {
             manager: UnsafeCell::new(manager),
             registration: UnsafeCell::new(registration),
-            sender,
-            receiver,
             hooks,
             _not_send: PhantomData,
         })
@@ -195,55 +187,6 @@ impl<H: BufferPinHook + EpochObserver> IouringBufferPool<H> {
         self.reg_mut().unregister(&ring.submitter())
     }
 
-    /// Drain all cross-thread buffer returns, decrementing lease counts.
-    ///
-    /// Returns the number of buffers successfully drained.
-    pub fn drain_returns(&self) -> usize {
-        let mut count = 0usize;
-        // Cache the last arena lookup — consecutive returns often share an arena.
-        let mut last_idx = ArenaIdx::new(usize::MAX);
-        let mut last_arena: Option<&crate::epoch::arena::Arena> = None;
-        while let Ok(ret) = self.receiver.try_recv() {
-            let arena = if ret.arena_idx == last_idx {
-                last_arena.unwrap()
-            } else {
-                match self.mgr().arena_at(ret.arena_idx) {
-                    Some(a) => {
-                        last_idx = ret.arena_idx;
-                        last_arena = Some(a);
-                        a
-                    }
-                    None => {
-                        tracing::error!(
-                            arena_idx = ret.arena_idx.as_usize(),
-                            epoch = ret.epoch,
-                            "received return for unknown arena index"
-                        );
-                        continue;
-                    }
-                }
-            };
-            if arena.epoch() != ret.epoch {
-                tracing::error!(
-                    expected_epoch = ret.epoch,
-                    actual_epoch = arena.epoch(),
-                    arena_idx = ret.arena_idx.as_usize(),
-                    "arena epoch mismatch in drain_returns"
-                );
-                continue;
-            }
-            arena.release_lease();
-            self.hooks.on_release(ret.epoch, ret.buf_id);
-            count += 1;
-        }
-        count
-    }
-
-    /// Create a [`TransferHandle`] for sending buffers to other threads.
-    pub fn transfer_handle(&self) -> TransferHandle {
-        TransferHandle::new(self.sender.clone())
-    }
-
     /// The current epoch number.
     pub fn epoch(&self) -> u64 {
         self.mgr().epoch()
@@ -331,19 +274,19 @@ mod tests {
     }
 
     #[test]
-    fn drain_returns_decrements_lease() {
+    fn cross_thread_release_decrements_lease() {
         let pool = test_pool();
 
         let buf = pool.lease(64).unwrap();
-        let handle = pool.transfer_handle();
-
-        let sendable = buf.into_sendable(&handle);
+        let sendable = buf.into_sendable();
         pool.rotate().unwrap();
 
+        // Dropping SendableBuffer atomically decrements the lease.
         drop(sendable);
 
-        let drained = pool.drain_returns();
-        assert_eq!(drained, 1);
+        // collect() should now succeed since outstanding leases == 0.
+        let collected = pool.collect();
+        assert!(collected >= 1);
     }
 
     #[test]
@@ -397,24 +340,22 @@ mod tests {
     }
 
     #[test]
-    fn drain_returns_count_and_enables_collection() {
+    fn cross_thread_release_enables_collection() {
         let pool = test_pool();
 
         let buf = pool.lease(64).unwrap();
         let epoch = buf.epoch();
-        let handle = pool.transfer_handle();
-
-        let sendable = buf.into_sendable(&handle);
+        let sendable = buf.into_sendable();
 
         pool.rotate().unwrap();
 
+        // Can't collect — SendableBuffer still alive.
         assert!(pool.collect_epoch(epoch).is_err());
 
+        // Dropping atomically decrements remote_returns.
         drop(sendable);
 
-        let drained = pool.drain_returns();
-        assert_eq!(drained, 1);
-
+        // Now collect_epoch succeeds — outstanding leases == 0.
         pool.collect_epoch(epoch).unwrap();
     }
 
@@ -449,4 +390,5 @@ mod tests {
         fn _assert_not_send<T>() {}
         _assert_not_send::<IouringBufferPool<NoopHooks>>();
     }
+
 }

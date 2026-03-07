@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::error::{Result, TurbineError};
 
@@ -26,8 +27,10 @@ pub struct Arena {
     capacity: usize,
     /// Current bump offset.
     offset: Cell<usize>,
-    /// Number of outstanding leases.
+    /// Number of outstanding leases (local acquires and releases).
     lease_count: Cell<usize>,
+    /// Number of cross-thread lease releases (atomically incremented by SendableBuffer::drop).
+    remote_returns: AtomicUsize,
     /// Monotonically increasing buffer ID within this arena.
     next_buf_id: Cell<u32>,
     /// Lifecycle state.
@@ -63,6 +66,7 @@ impl Arena {
             capacity: size,
             offset: Cell::new(0),
             lease_count: Cell::new(0),
+            remote_returns: AtomicUsize::new(0),
             next_buf_id: Cell::new(0),
             state: Cell::new(ArenaState::Collected),
             epoch: Cell::new(0),
@@ -105,10 +109,25 @@ impl Arena {
         self.lease_count.set(count - 1);
     }
 
-    /// Current number of outstanding leases.
+    /// Record a cross-thread lease release (called from SendableBuffer::drop).
+    #[inline]
+    pub fn remote_release(&self) {
+        self.remote_returns.fetch_add(1, Ordering::Release);
+    }
+
+    /// Pointer to the remote_returns counter for use by SendableBuffer.
+    #[inline]
+    pub fn remote_returns_ptr(&self) -> *const AtomicUsize {
+        &self.remote_returns as *const AtomicUsize
+    }
+
+    /// Current number of outstanding leases (local minus remote returns).
     #[inline]
     pub fn lease_count(&self) -> usize {
-        self.lease_count.get()
+        let local = self.lease_count.get();
+        let remote = self.remote_returns.load(Ordering::Acquire);
+        debug_assert!(local >= remote, "lease underflow: local={local}, remote={remote}");
+        local - remote
     }
 
     /// Bytes remaining in this arena.
@@ -150,10 +169,12 @@ impl Arena {
         self.epoch.set(epoch);
     }
 
-    /// Reset the arena for reuse: zero the bump offset and buf_id counter.
+    /// Reset the arena for reuse: zero the bump offset, buf_id counter, lease count, and remote returns.
     pub fn reset(&self) {
         self.offset.set(0);
         self.next_buf_id.set(0);
+        self.lease_count.set(0);
+        self.remote_returns.store(0, Ordering::Relaxed);
         self.state.set(ArenaState::Writable);
     }
 
@@ -197,12 +218,14 @@ impl Arena {
 impl Drop for Arena {
     #[cold]
     fn drop(&mut self) {
-        let count = self.lease_count.get();
-        if count > 0 {
-            debug_assert_eq!(count, 0, "arena dropped with {} outstanding leases", count);
+        let local = self.lease_count.get();
+        let remote = *self.remote_returns.get_mut();
+        let outstanding = local - remote;
+        if outstanding > 0 {
+            debug_assert_eq!(outstanding, 0, "arena dropped with {} outstanding leases", outstanding);
             tracing::warn!(
                 epoch = self.epoch.get(),
-                leases = count,
+                leases = outstanding,
                 "arena dropped with outstanding leases"
             );
         }
@@ -281,6 +304,38 @@ mod tests {
         let iov = arena.as_iovec();
         assert_eq!(iov.iov_len, 8192);
         assert_eq!(iov.iov_base as *mut u8, arena.base_ptr());
+    }
+
+    #[test]
+    fn remote_release_decrements_outstanding() {
+        let arena = Arena::new(4096).unwrap();
+        arena.acquire_lease();
+        arena.acquire_lease();
+        assert_eq!(arena.lease_count(), 2);
+
+        arena.remote_release();
+        assert_eq!(arena.lease_count(), 1);
+
+        arena.remote_release();
+        assert_eq!(arena.lease_count(), 0);
+    }
+
+    #[test]
+    fn reset_clears_remote_returns() {
+        let arena = Arena::new(4096).unwrap();
+        arena.acquire_lease();
+        arena.remote_release();
+        assert_eq!(arena.lease_count(), 0);
+
+        arena.reset();
+        // After reset, lease_count should be 0 with no remote returns.
+        assert_eq!(arena.lease_count(), 0);
+
+        // New leases should work correctly.
+        arena.acquire_lease();
+        assert_eq!(arena.lease_count(), 1);
+        arena.release_lease();
+        assert_eq!(arena.lease_count(), 0);
     }
 
     #[test]

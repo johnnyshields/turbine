@@ -6,7 +6,6 @@ use crate::ArenaIdx;
 /// metrics, or debugging.
 pub trait BufferPinHook {
     fn on_pin(&self, epoch: u64, buf_id: u32);
-    fn on_release(&self, epoch: u64, buf_id: u32);
 }
 
 /// Observer notified on epoch transitions.
@@ -37,8 +36,6 @@ pub struct NoopHooks;
 impl BufferPinHook for NoopHooks {
     #[inline]
     fn on_pin(&self, _epoch: u64, _buf_id: u32) {}
-    #[inline]
-    fn on_release(&self, _epoch: u64, _buf_id: u32) {}
 }
 
 impl EpochObserver for NoopHooks {
