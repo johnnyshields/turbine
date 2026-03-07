@@ -69,7 +69,7 @@ mod tests {
 
     #[test]
     fn mmap_display() {
-        let e = TurbineError::Mmap(std::io::Error::new(std::io::ErrorKind::Other, "oom"));
+        let e = TurbineError::Mmap(std::io::Error::other("oom"));
         let msg = format!("{e}");
         assert!(msg.contains("mmap"));
         assert!(msg.contains("oom"));
@@ -77,7 +77,7 @@ mod tests {
 
     #[test]
     fn munmap_display() {
-        let e = TurbineError::Munmap(std::io::Error::new(std::io::ErrorKind::Other, "bad"));
+        let e = TurbineError::Munmap(std::io::Error::other("bad"));
         let msg = format!("{e}");
         assert!(msg.contains("munmap"));
         assert!(msg.contains("bad"));
@@ -85,7 +85,7 @@ mod tests {
 
     #[test]
     fn registration_display() {
-        let e = TurbineError::Registration(std::io::Error::new(std::io::ErrorKind::Other, "fail"));
+        let e = TurbineError::Registration(std::io::Error::other("fail"));
         let msg = format!("{e}");
         assert!(msg.contains("registration"));
         assert!(msg.contains("fail"));

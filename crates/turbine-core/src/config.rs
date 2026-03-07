@@ -41,7 +41,7 @@ impl PoolConfig {
                 "arena_size must be > 0".into(),
             ));
         }
-        if self.arena_size % self.page_size != 0 {
+        if !self.arena_size.is_multiple_of(self.page_size) {
             return Err(TurbineError::InvalidConfig(format!(
                 "arena_size ({}) must be a multiple of page_size ({})",
                 self.arena_size, self.page_size
