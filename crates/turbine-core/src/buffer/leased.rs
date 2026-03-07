@@ -110,6 +110,7 @@ impl LeasedBuffer {
     /// Consumes `self` **without** calling `Drop`, so the arena lease stays alive.
     /// The lease is transferred to the `SendableBuffer`; when it drops, a
     /// `ReturnedBuffer` message is sent through the channel for `drain_returns()`.
+    #[inline]
     pub fn into_sendable(self, handle: &TransferHandle) -> SendableBuffer {
         let me = std::mem::ManuallyDrop::new(self);
         SendableBuffer::new(
@@ -118,7 +119,7 @@ impl LeasedBuffer {
             me.epoch,
             me.arena_idx,
             me.buf_id,
-            handle.sender().clone(),
+            handle.sender_ptr(),
         )
     }
 

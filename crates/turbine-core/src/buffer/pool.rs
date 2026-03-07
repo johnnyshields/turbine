@@ -11,7 +11,7 @@ use crate::error::{Result, TurbineError};
 use crate::gc::{BufferPinHook, EpochObserver};
 use crate::ring::registration::RingRegistration;
 use crate::transfer::handle::{ReturnedBuffer, TransferHandle};
-use crate::SlotId;
+use crate::{ArenaIdx, SlotId};
 
 /// The main API for epoch-based io_uring buffer management.
 ///
@@ -200,27 +200,41 @@ impl<H: BufferPinHook + EpochObserver> IouringBufferPool<H> {
     /// Returns the number of buffers successfully drained.
     pub fn drain_returns(&self) -> usize {
         let mut count = 0usize;
+        // Cache the last arena lookup — consecutive returns often share an arena.
+        let mut last_idx = ArenaIdx::new(usize::MAX);
+        let mut last_arena: Option<&crate::epoch::arena::Arena> = None;
         while let Ok(ret) = self.receiver.try_recv() {
-            if let Some(arena) = self.mgr().arena_at(ret.arena_idx) {
-                if arena.epoch() != ret.epoch {
-                    tracing::error!(
-                        expected_epoch = ret.epoch,
-                        actual_epoch = arena.epoch(),
-                        arena_idx = ret.arena_idx.as_usize(),
-                        "arena epoch mismatch in drain_returns"
-                    );
-                    continue;
-                }
-                arena.release_lease();
-                self.hooks.on_release(ret.epoch, ret.buf_id);
-                count += 1;
+            let arena = if ret.arena_idx == last_idx {
+                last_arena.unwrap()
             } else {
+                match self.mgr().arena_at(ret.arena_idx) {
+                    Some(a) => {
+                        last_idx = ret.arena_idx;
+                        last_arena = Some(a);
+                        a
+                    }
+                    None => {
+                        tracing::error!(
+                            arena_idx = ret.arena_idx.as_usize(),
+                            epoch = ret.epoch,
+                            "received return for unknown arena index"
+                        );
+                        continue;
+                    }
+                }
+            };
+            if arena.epoch() != ret.epoch {
                 tracing::error!(
+                    expected_epoch = ret.epoch,
+                    actual_epoch = arena.epoch(),
                     arena_idx = ret.arena_idx.as_usize(),
-                    epoch = ret.epoch,
-                    "received return for unknown arena index"
+                    "arena epoch mismatch in drain_returns"
                 );
+                continue;
             }
+            arena.release_lease();
+            self.hooks.on_release(ret.epoch, ret.buf_id);
+            count += 1;
         }
         count
     }
