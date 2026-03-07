@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["crates/turbine-core", "crates/turbine"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
