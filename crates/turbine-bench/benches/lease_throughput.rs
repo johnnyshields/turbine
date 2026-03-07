@@ -10,16 +10,21 @@ use turbine_core::buffer::pool::IouringBufferPool;
 use turbine_core::config::PoolConfig;
 use turbine_core::gc::NoopHooks;
 
+fn bench_config(arena_size: usize) -> PoolConfig {
+    PoolConfig {
+        arena_size,
+        initial_arenas: 3,
+        page_size: 4096,
+        ..Default::default()
+    }
+}
+
 fn bench_turbine(c: &mut Criterion) {
     let mut group = c.benchmark_group("lease_throughput/turbine");
 
     for &size in SIZES {
         let arena_size = arena_size_for(size);
-        let config = PoolConfig {
-            arena_size,
-            arena_count: 3,
-            page_size: 4096,
-        };
+        let config = bench_config(arena_size);
 
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &sz| {
@@ -29,12 +34,8 @@ fn bench_turbine(c: &mut Criterion) {
                 let buf = match pool.lease(sz) {
                     Some(buf) => buf,
                     None => {
-                        // Arena full — rotate and collect the oldest retired epoch.
                         pool.rotate().unwrap();
-                        let oldest = pool.clock().retained_epochs().next();
-                        if let Some(epoch) = oldest {
-                            let _ = pool.try_collect(epoch);
-                        }
+                        pool.collect();
                         pool.lease(sz).expect("fresh arena should have space")
                     }
                 };

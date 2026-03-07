@@ -10,17 +10,22 @@ use turbine_core::gc::NoopHooks;
 /// about rotation overhead than large-buffer throughput.
 const EPOCH_SIZES: &[usize] = &[64, 512, 4096];
 
+fn bench_config(arena_size: usize) -> PoolConfig {
+    PoolConfig {
+        arena_size,
+        initial_arenas: 3,
+        page_size: 4096,
+        ..Default::default()
+    }
+}
+
 /// Full epoch lifecycle: lease a batch → rotate → drop all → collect.
 fn bench_epoch_lifecycle(c: &mut Criterion) {
     let mut group = c.benchmark_group("epoch_lifecycle");
 
     for &size in EPOCH_SIZES {
         let arena_size = arena_size_for(size);
-        let config = PoolConfig {
-            arena_size,
-            arena_count: 3,
-            page_size: 4096,
-        };
+        let config = bench_config(arena_size);
         let bufs_per_batch = (arena_size / size.max(1)).min(64);
 
         group.throughput(Throughput::Elements(bufs_per_batch as u64));
@@ -47,7 +52,7 @@ fn bench_epoch_lifecycle(c: &mut Criterion) {
                 drop(bufs);
 
                 // Collect the retired epoch.
-                pool.try_collect(epoch).unwrap();
+                pool.collect_epoch(epoch).unwrap();
             });
         });
     }
@@ -58,8 +63,9 @@ fn bench_epoch_lifecycle(c: &mut Criterion) {
 fn bench_rotate_collect_only(c: &mut Criterion) {
     let config = PoolConfig {
         arena_size: 4096,
-        arena_count: 3,
+        initial_arenas: 3,
         page_size: 4096,
+        ..Default::default()
     };
 
     c.bench_function("rotate_collect_only", |b| {
@@ -68,7 +74,7 @@ fn bench_rotate_collect_only(c: &mut Criterion) {
         b.iter(|| {
             let epoch = pool.epoch();
             pool.rotate().unwrap();
-            pool.try_collect(epoch).unwrap();
+            pool.collect_epoch(epoch).unwrap();
             black_box(epoch);
         });
     });
