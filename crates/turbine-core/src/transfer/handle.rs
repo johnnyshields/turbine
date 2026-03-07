@@ -1,10 +1,12 @@
 use crossbeam_channel::Sender;
 
+use crate::ArenaIdx;
+
 /// Message sent back through the channel when a [`SendableBuffer`] is dropped.
 #[derive(Debug, Clone, Copy)]
 pub struct ReturnedBuffer {
     pub epoch: u64,
-    pub arena_idx: usize,
+    pub arena_idx: ArenaIdx,
     pub buf_id: u32,
 }
 
@@ -32,7 +34,7 @@ pub struct SendableBuffer {
     ptr: *const u8,
     len: usize,
     epoch: u64,
-    arena_idx: usize,
+    arena_idx: ArenaIdx,
     buf_id: u32,
     sender: Sender<ReturnedBuffer>,
 }
@@ -48,7 +50,7 @@ impl SendableBuffer {
         ptr: *const u8,
         len: usize,
         epoch: u64,
-        arena_idx: usize,
+        arena_idx: ArenaIdx,
         buf_id: u32,
         sender: Sender<ReturnedBuffer>,
     ) -> Self {
@@ -110,7 +112,7 @@ mod tests {
                 data.as_ptr(),
                 data.len(),
                 42,
-                7,
+                ArenaIdx::new(7),
                 0,
                 tx,
             );
@@ -119,7 +121,7 @@ mod tests {
 
         let returned = rx.try_recv().expect("should receive ReturnedBuffer on drop");
         assert_eq!(returned.epoch, 42);
-        assert_eq!(returned.arena_idx, 7);
+        assert_eq!(returned.arena_idx, ArenaIdx::new(7));
     }
 
     #[test]
@@ -130,8 +132,8 @@ mod tests {
 
         // Both handles should reference the same channel.
         let data = [0u8; 1];
-        let _buf = SendableBuffer::new(data.as_ptr(), 1, 1, 0, 0, handle.sender().clone());
-        let _buf2 = SendableBuffer::new(data.as_ptr(), 1, 2, 1, 0, handle2.sender().clone());
+        let _buf = SendableBuffer::new(data.as_ptr(), 1, 1, ArenaIdx::new(0), 0, handle.sender().clone());
+        let _buf2 = SendableBuffer::new(data.as_ptr(), 1, 2, ArenaIdx::new(1), 0, handle2.sender().clone());
 
         drop(_buf);
         drop(_buf2);
@@ -146,11 +148,11 @@ mod tests {
     fn returned_buffer_fields_correct() {
         let rb = ReturnedBuffer {
             epoch: 99,
-            arena_idx: 3,
+            arena_idx: ArenaIdx::new(3),
             buf_id: 5,
         };
         assert_eq!(rb.epoch, 99);
-        assert_eq!(rb.arena_idx, 3);
+        assert_eq!(rb.arena_idx, ArenaIdx::new(3));
 
         // Clone and Copy work.
         let rb2 = rb;

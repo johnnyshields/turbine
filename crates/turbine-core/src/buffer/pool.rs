@@ -1,3 +1,4 @@
+use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
@@ -5,34 +6,65 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 
 use crate::buffer::leased::LeasedBuffer;
 use crate::config::PoolConfig;
-use crate::epoch::clock::EpochClock;
-use crate::error::Result;
+use crate::epoch::manager::ArenaManager;
+use crate::error::{Result, TurbineError};
 use crate::gc::{BufferPinHook, EpochObserver};
 use crate::ring::registration::RingRegistration;
 use crate::transfer::handle::{ReturnedBuffer, TransferHandle};
+use crate::SlotId;
 
 /// The main API for epoch-based io_uring buffer management.
 ///
-/// Owns an [`EpochClock`] (ring of arenas), a [`RingRegistration`], and a
-/// crossbeam channel for cross-thread buffer returns.
+/// Owns an [`ArenaManager`] (slab of arenas with drain queue and free pool),
+/// a [`RingRegistration`], and a crossbeam channel for cross-thread buffer returns.
+///
+/// Uses `UnsafeCell` for interior mutability of the manager and registration.
+/// This is safe because the pool is `!Send` (enforced by `PhantomData<Rc<()>>`),
+/// guaranteeing single-threaded access. No method holds a reference to the
+/// inner data across a call to another method.
 pub struct IouringBufferPool<H> {
-    clock: EpochClock,
-    registration: RingRegistration,
+    manager: UnsafeCell<ArenaManager>,
+    registration: UnsafeCell<RingRegistration>,
     sender: Sender<ReturnedBuffer>,
     receiver: Receiver<ReturnedBuffer>,
     hooks: H,
     _not_send: PhantomData<Rc<()>>,
 }
 
+impl<H> IouringBufferPool<H> {
+    fn mgr(&self) -> &ArenaManager {
+        unsafe { &*self.manager.get() }
+    }
+
+    /// # Safety justification
+    /// Pool is !Send (PhantomData<Rc<()>>), guaranteeing single-threaded access.
+    /// No method holds a reference across a call to another method.
+    #[allow(clippy::mut_from_ref)]
+    fn mgr_mut(&self) -> &mut ArenaManager {
+        unsafe { &mut *self.manager.get() }
+    }
+
+    fn reg(&self) -> &RingRegistration {
+        unsafe { &*self.registration.get() }
+    }
+
+    /// See mgr_mut safety justification.
+    #[allow(clippy::mut_from_ref)]
+    fn reg_mut(&self) -> &mut RingRegistration {
+        unsafe { &mut *self.registration.get() }
+    }
+}
+
 impl<H: BufferPinHook + EpochObserver> IouringBufferPool<H> {
     /// Create a new buffer pool with the given configuration and hooks.
     pub fn new(config: PoolConfig, hooks: H) -> Result<Self> {
-        let clock = EpochClock::new(&config)?;
+        let manager = ArenaManager::new(&config)?;
+        let registration = RingRegistration::new(config.registration_slots);
         let (sender, receiver) = unbounded();
 
         Ok(Self {
-            clock,
-            registration: RingRegistration::new(),
+            manager: UnsafeCell::new(manager),
+            registration: UnsafeCell::new(registration),
             sender,
             receiver,
             hooks,
@@ -45,45 +77,117 @@ impl<H: BufferPinHook + EpochObserver> IouringBufferPool<H> {
     /// Returns `None` if the arena is full. The returned [`LeasedBuffer`] is
     /// `!Send` and must not leave the owning thread.
     pub fn lease(&self, len: usize) -> Option<LeasedBuffer> {
-        let arena = self.clock.current_arena();
+        let mgr = self.mgr();
+        let arena = mgr.current_arena();
         let (ptr, buf_id) = arena.alloc(len)?;
         arena.acquire_lease();
 
         self.hooks.on_pin(arena.epoch(), buf_id);
 
+        let arena_idx = mgr.current_arena_idx();
+        let slot_id = match self.reg().slot_for_arena(arena_idx) {
+            Some(id) => id,
+            None => {
+                if self.reg().is_registered() {
+                    tracing::warn!(
+                        arena_idx = arena_idx.as_usize(),
+                        "arena has no registration slot despite pool being registered"
+                    );
+                }
+                SlotId::new(0)
+            }
+        };
         // SAFETY: ptr points into the arena's mmap region which is valid
         // for the arena's lifetime. The arena outlives the lease because
         // lease_count > 0 prevents collection.
-        let arena_idx = self.clock.current_arena_idx();
-        let buf = unsafe { LeasedBuffer::new(ptr, len, arena.epoch(), buf_id, arena, arena_idx) };
+        let buf = unsafe {
+            LeasedBuffer::new(ptr, len, arena.epoch(), buf_id, slot_id, arena, arena_idx)
+        };
         Some(buf)
+    }
+
+    /// Lease `len` bytes, auto-rotating if the current arena is full.
+    ///
+    /// Tries to lease from the current arena. If full, rotates to a new epoch
+    /// and retries. Returns an error if rotation fails or the new arena is
+    /// also too small.
+    pub fn lease_or_rotate(&self, len: usize) -> Result<LeasedBuffer> {
+        if let Some(buf) = self.lease(len) {
+            return Ok(buf);
+        }
+
+        self.rotate()?;
+
+        self.lease(len).ok_or_else(|| {
+            let available = self.mgr().current_arena().available();
+            TurbineError::ArenaFull {
+                requested: len,
+                available,
+            }
+        })
     }
 
     /// Rotate to a new epoch: retire the current arena and activate the next.
     pub fn rotate(&self) -> Result<()> {
-        let (retired, active) = self.clock.rotate()?;
-        self.hooks.on_rotate(retired, active);
+        let result = self.mgr_mut().rotate()?;
+        self.hooks.on_rotate(result.retired_epoch, result.new_epoch);
+
+        if let Some(new_idx) = result.new_arena_idx {
+            let _ = self.reg_mut().register_arena(new_idx);
+            self.hooks.on_arena_alloc(new_idx);
+        }
+
         Ok(())
+    }
+
+    /// Collect all draining arenas with zero leases back to the free pool.
+    ///
+    /// Returns the number of arenas collected.
+    pub fn collect(&self) -> usize {
+        let collected = self.mgr_mut().collect();
+        self.hooks.on_collect_sweep(collected);
+        collected
     }
 
     /// Try to collect (reclaim) the arena that served `epoch`.
     ///
     /// Succeeds if all leases for that epoch have been returned.
-    pub fn try_collect(&self, epoch: u64) -> Result<()> {
-        self.clock.try_collect(epoch)?;
+    pub fn collect_epoch(&self, epoch: u64) -> Result<()> {
+        let mgr = self.mgr();
+        let arena = mgr
+            .live_arenas()
+            .find(|(_, a)| a.epoch() == epoch)
+            .map(|(_, a)| a)
+            .ok_or(TurbineError::EpochNotFound(epoch))?;
+
+        if arena.lease_count() > 0 {
+            return Err(TurbineError::EpochNotCollectable(
+                epoch,
+                arena.lease_count(),
+            ));
+        }
+
+        arena.set_state(crate::epoch::arena::ArenaState::Collected);
         self.hooks.on_collect(epoch);
         Ok(())
     }
 
+    /// Shrink the free pool, munmapping excess arenas beyond `max_free_arenas`.
+    ///
+    /// Returns the number of arenas freed.
+    pub fn shrink(&self) -> usize {
+        self.mgr_mut().shrink()
+    }
+
     /// Register all arenas as io_uring fixed buffers.
-    pub fn register(&mut self, ring: &io_uring::IoUring) -> Result<()> {
-        self.registration
-            .register(&ring.submitter(), self.clock.arenas())
+    pub fn register(&self, ring: &io_uring::IoUring) -> Result<()> {
+        self.reg_mut()
+            .register(&ring.submitter(), self.mgr().live_arenas())
     }
 
     /// Unregister io_uring fixed buffers.
-    pub fn unregister(&mut self, ring: &io_uring::IoUring) -> Result<()> {
-        self.registration.unregister(&ring.submitter())
+    pub fn unregister(&self, ring: &io_uring::IoUring) -> Result<()> {
+        self.reg_mut().unregister(&ring.submitter())
     }
 
     /// Drain all cross-thread buffer returns, decrementing lease counts.
@@ -92,12 +196,12 @@ impl<H: BufferPinHook + EpochObserver> IouringBufferPool<H> {
     pub fn drain_returns(&self) -> usize {
         let mut count = 0usize;
         while let Ok(ret) = self.receiver.try_recv() {
-            if let Some(arena) = self.clock.arena_at(ret.arena_idx) {
+            if let Some(arena) = self.mgr().arena_at(ret.arena_idx) {
                 if arena.epoch() != ret.epoch {
                     tracing::error!(
                         expected_epoch = ret.epoch,
                         actual_epoch = arena.epoch(),
-                        arena_idx = ret.arena_idx,
+                        arena_idx = ret.arena_idx.as_usize(),
                         "arena epoch mismatch in drain_returns"
                     );
                     continue;
@@ -107,7 +211,7 @@ impl<H: BufferPinHook + EpochObserver> IouringBufferPool<H> {
                 count += 1;
             } else {
                 tracing::error!(
-                    arena_idx = ret.arena_idx,
+                    arena_idx = ret.arena_idx.as_usize(),
                     epoch = ret.epoch,
                     "received return for unknown arena index"
                 );
@@ -123,17 +227,17 @@ impl<H: BufferPinHook + EpochObserver> IouringBufferPool<H> {
 
     /// The current epoch number.
     pub fn epoch(&self) -> u64 {
-        self.clock.epoch()
+        self.mgr().epoch()
     }
 
     /// Bytes available in the current arena.
     pub fn available(&self) -> usize {
-        self.clock.current_arena().available()
+        self.mgr().current_arena().available()
     }
 
-    /// Reference to the underlying epoch clock.
-    pub fn clock(&self) -> &EpochClock {
-        &self.clock
+    /// Number of arenas in the drain queue.
+    pub fn draining_count(&self) -> usize {
+        self.mgr().draining_count()
     }
 }
 
@@ -145,7 +249,10 @@ mod tests {
     fn test_pool() -> IouringBufferPool<NoopHooks> {
         let config = PoolConfig {
             arena_size: 4096,
-            arena_count: 3,
+            initial_arenas: 3,
+            max_free_arenas: 4,
+            max_total_arenas: 0,
+            registration_slots: 32,
             page_size: 4096,
         };
         IouringBufferPool::new(config, NoopHooks).unwrap()
@@ -191,21 +298,17 @@ mod tests {
     fn lease_rotate_collect_lifecycle() {
         let pool = test_pool();
 
-        // Lease from epoch 0.
         let buf = pool.lease(128).unwrap();
         assert_eq!(buf.epoch(), 0);
 
-        // Rotate to epoch 1.
         pool.rotate().unwrap();
 
         // Can't collect epoch 0 — still has a lease.
-        assert!(pool.try_collect(0).is_err());
+        assert!(pool.collect_epoch(0).is_err());
 
-        // Drop the lease.
         drop(buf);
 
-        // Now collection succeeds.
-        pool.try_collect(0).unwrap();
+        pool.collect_epoch(0).unwrap();
     }
 
     #[test]
@@ -215,15 +318,11 @@ mod tests {
         let buf = pool.lease(64).unwrap();
         let handle = pool.transfer_handle();
 
-        // Convert to sendable — lease stays alive, LeasedBuffer is consumed.
         let sendable = buf.into_sendable(&handle);
-
         pool.rotate().unwrap();
 
-        // Drop sendable — sends ReturnedBuffer through channel.
         drop(sendable);
 
-        // Drain returns.
         let drained = pool.drain_returns();
         assert_eq!(drained, 1);
     }
@@ -239,32 +338,43 @@ mod tests {
     }
 
     #[test]
-    fn multi_rotation_wrap_around() {
-        // Pool with arena_count=2 so wrap happens after 2 rotations.
-        let config = PoolConfig {
-            arena_size: 4096,
-            arena_count: 2,
-            page_size: 4096,
-        };
-        let pool = IouringBufferPool::new(config, NoopHooks).unwrap();
+    fn rotate_with_outstanding_leases() {
+        // With the new architecture, rotate always succeeds even with leases.
+        let pool = test_pool();
 
-        assert_eq!(pool.epoch(), 0);
         let _buf0 = pool.lease(64).unwrap();
-        drop(_buf0);
+        pool.rotate().unwrap();
 
-        pool.rotate().unwrap(); // epoch 1, arena idx 1
-        assert_eq!(pool.epoch(), 1);
+        let _buf1 = pool.lease(64).unwrap();
+        pool.rotate().unwrap();
 
-        pool.try_collect(0).unwrap(); // collect epoch 0
-
-        pool.rotate().unwrap(); // epoch 2, arena idx 0 (wraps)
         assert_eq!(pool.epoch(), 2);
+        assert_eq!(pool.draining_count(), 2);
+    }
 
-        // Arena 0 was recycled — should be writable and usable again.
-        let buf2 = pool.lease(128).unwrap();
-        assert_eq!(buf2.epoch(), 2);
-        assert_eq!(buf2.len(), 128);
-        assert_eq!(pool.available(), 4096 - 128);
+    #[test]
+    fn lease_or_rotate_auto_rotates() {
+        let pool = test_pool();
+
+        let _buf = pool.lease(4096).unwrap();
+        assert!(pool.lease(1).is_none());
+
+        let buf = pool.lease_or_rotate(64).unwrap();
+        assert_eq!(buf.epoch(), 1);
+        assert_eq!(pool.epoch(), 1);
+    }
+
+    #[test]
+    fn collect_sweeps_draining() {
+        let pool = test_pool();
+
+        pool.rotate().unwrap();
+        pool.rotate().unwrap();
+        assert_eq!(pool.draining_count(), 2);
+
+        let collected = pool.collect();
+        assert_eq!(collected, 2);
+        assert_eq!(pool.draining_count(), 0);
     }
 
     #[test]
@@ -275,36 +385,49 @@ mod tests {
         let epoch = buf.epoch();
         let handle = pool.transfer_handle();
 
-        // Convert to sendable — lease stays alive.
         let sendable = buf.into_sendable(&handle);
 
-        // Rotate so epoch 0 is retired.
         pool.rotate().unwrap();
 
-        // Can't collect yet — sendable still holds a lease.
-        assert!(pool.try_collect(epoch).is_err());
+        assert!(pool.collect_epoch(epoch).is_err());
 
-        // Drop sendable — sends ReturnedBuffer through channel.
         drop(sendable);
 
-        // Drain returns — should process 1 return.
         let drained = pool.drain_returns();
         assert_eq!(drained, 1);
 
-        // Now collection succeeds.
-        pool.try_collect(epoch).unwrap();
+        pool.collect_epoch(epoch).unwrap();
+    }
+
+    #[test]
+    fn shrink_cleans_up_arenas() {
+        let config = PoolConfig {
+            arena_size: 4096,
+            initial_arenas: 5,
+            max_free_arenas: 1,
+            max_total_arenas: 0,
+            registration_slots: 32,
+            page_size: 4096,
+        };
+        let pool = IouringBufferPool::new(config, NoopHooks).unwrap();
+
+        // Use up arenas via rotation.
+        pool.rotate().unwrap();
+        pool.rotate().unwrap();
+
+        // Collect draining arenas back to free pool.
+        let collected = pool.collect();
+        assert!(collected >= 2);
+
+        // Shrink should remove excess free arenas.
+        let removed = pool.shrink();
+        assert!(removed > 0, "should have removed excess free arenas");
     }
 
     /// Compile-time assertion that IouringBufferPool is !Send.
-    /// If this test compiles, the pool cannot be sent across threads.
     #[test]
     fn pool_is_not_send() {
-        fn _assert_not_send<T>() {
-            // If IouringBufferPool were Send, this function body could call
-            // a function requiring T: Send. We just need the signature to exist
-            // as a witness that the type is NOT Send. The real assertion is the
-            // PhantomData<Rc<()>> marker on the struct.
-        }
+        fn _assert_not_send<T>() {}
         _assert_not_send::<IouringBufferPool<NoopHooks>>();
     }
 }

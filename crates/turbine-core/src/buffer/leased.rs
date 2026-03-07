@@ -4,6 +4,7 @@ use std::rc::Rc;
 use crate::buffer::pinned::PinnedWrite;
 use crate::epoch::arena::Arena;
 use crate::transfer::handle::{SendableBuffer, TransferHandle};
+use crate::{ArenaIdx, SlotId};
 
 /// A leased buffer from an epoch arena. Not `Send` — must stay on the
 /// owning thread.
@@ -16,9 +17,11 @@ pub struct LeasedBuffer {
     len: usize,
     epoch: u64,
     buf_id: u32,
+    /// io_uring registration slot for this buffer's arena.
+    slot_id: SlotId,
     /// Raw pointer back to the arena for lease release on Drop.
     arena: *const Arena,
-    arena_idx: usize,
+    arena_idx: ArenaIdx,
     /// Prevent Send/Sync.
     _not_send: PhantomData<Rc<()>>,
 }
@@ -35,14 +38,16 @@ impl LeasedBuffer {
         len: usize,
         epoch: u64,
         buf_id: u32,
+        slot_id: SlotId,
         arena: *const Arena,
-        arena_idx: usize,
+        arena_idx: ArenaIdx,
     ) -> Self {
         Self {
             ptr,
             len,
             epoch,
             buf_id,
+            slot_id,
             arena,
             arena_idx,
             _not_send: PhantomData,
@@ -74,9 +79,14 @@ impl LeasedBuffer {
         self.buf_id
     }
 
-    /// The index of the arena in the epoch clock ring.
-    pub fn arena_idx(&self) -> usize {
+    /// The index of the arena in the slab.
+    pub fn arena_idx(&self) -> ArenaIdx {
         self.arena_idx
+    }
+
+    /// The io_uring registration slot for this buffer's arena.
+    pub fn slot_id(&self) -> SlotId {
+        self.slot_id
     }
 
     /// Length of the buffer in bytes.
@@ -144,7 +154,7 @@ mod tests {
             std::ptr::write_bytes(ptr, 0xAB, 64);
         }
 
-        let buf = unsafe { LeasedBuffer::new(ptr, 64, 1, buf_id, &arena as *const Arena, 0) };
+        let buf = unsafe { LeasedBuffer::new(ptr, 64, 1, buf_id, SlotId::new(0), &arena as *const Arena, ArenaIdx::new(0)) };
 
         assert_eq!(buf.len(), 64);
         assert!(!buf.is_empty());
@@ -167,7 +177,7 @@ mod tests {
         let (ptr, buf_id) = arena.alloc(16).unwrap();
         arena.acquire_lease();
 
-        let mut buf = unsafe { LeasedBuffer::new(ptr, 16, 1, buf_id, &arena as *const Arena, 0) };
+        let mut buf = unsafe { LeasedBuffer::new(ptr, 16, 1, buf_id, SlotId::new(0), &arena as *const Arena, ArenaIdx::new(0)) };
         buf.as_mut_slice().copy_from_slice(&[1u8; 16]);
         assert!(buf.as_slice().iter().all(|&b| b == 1));
     }
@@ -184,7 +194,7 @@ mod tests {
 
         {
             let _buf =
-                unsafe { LeasedBuffer::new(ptr, 32, 1, buf_id, &arena as *const Arena, 0) };
+                unsafe { LeasedBuffer::new(ptr, 32, 1, buf_id, SlotId::new(0), &arena as *const Arena, ArenaIdx::new(0)) };
             assert_eq!(arena.lease_count(), 1);
         }
         // After drop, lease count should be decremented.
@@ -201,7 +211,7 @@ mod tests {
         let (ptr, buf_id) = arena.alloc(0).unwrap();
         arena.acquire_lease();
 
-        let buf = unsafe { LeasedBuffer::new(ptr, 0, 1, buf_id, &arena as *const Arena, 0) };
+        let buf = unsafe { LeasedBuffer::new(ptr, 0, 1, buf_id, SlotId::new(0), &arena as *const Arena, ArenaIdx::new(0)) };
         assert!(buf.is_empty());
         assert_eq!(buf.len(), 0);
         assert_eq!(buf.as_slice(), &[]);
@@ -216,11 +226,11 @@ mod tests {
         let (ptr, buf_id) = arena.alloc(64).unwrap();
         arena.acquire_lease();
 
-        let mut buf = unsafe { LeasedBuffer::new(ptr, 64, 1, buf_id, &arena as *const Arena, 0) };
+        let mut buf = unsafe { LeasedBuffer::new(ptr, 64, 1, buf_id, SlotId::new(0), &arena as *const Arena, ArenaIdx::new(0)) };
         {
             let pinned = buf.pin_for_write();
             assert_eq!(pinned.len(), 64);
-            assert_eq!(pinned.buf_index(), 0);
+            assert_eq!(pinned.buf_index(), SlotId::new(0));
         }
         // Buffer is usable again after PinnedWrite is dropped.
         assert_eq!(buf.len(), 64);
@@ -238,7 +248,7 @@ mod tests {
         let (ptr, buf_id) = arena.alloc(64).unwrap();
         arena.acquire_lease();
 
-        let buf = unsafe { LeasedBuffer::new(ptr, 64, 1, buf_id, &arena as *const Arena, 0) };
+        let buf = unsafe { LeasedBuffer::new(ptr, 64, 1, buf_id, SlotId::new(0), &arena as *const Arena, ArenaIdx::new(0)) };
 
         let (tx, rx) = unbounded();
         let handle = TransferHandle::new(tx);
@@ -252,7 +262,7 @@ mod tests {
 
         let returned = rx.try_recv().expect("should receive ReturnedBuffer on drop");
         assert_eq!(returned.epoch, 1);
-        assert_eq!(returned.arena_idx, 0);
+        assert_eq!(returned.arena_idx, ArenaIdx::new(0));
         assert_eq!(returned.buf_id, buf_id);
 
         // Manually release the lease (normally drain_returns would do this).
