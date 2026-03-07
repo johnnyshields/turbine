@@ -1,6 +1,7 @@
 use crate::config::PoolConfig;
 use crate::epoch::arena::{Arena, ArenaState};
 use crate::error::{Result, TurbineError};
+use crate::ArenaIdx;
 
 /// Result of a rotate operation.
 #[derive(Debug)]
@@ -8,7 +9,7 @@ pub struct RotateResult {
     pub retired_epoch: u64,
     pub new_epoch: u64,
     /// Some(slab_idx) if a fresh arena was allocated (needs io_uring registration).
-    pub new_arena_idx: Option<usize>,
+    pub new_arena_idx: Option<ArenaIdx>,
 }
 
 /// Slab-based arena manager with drain queue and free pool.
@@ -18,9 +19,10 @@ pub struct RotateResult {
 /// recycled after all leases return.
 pub struct ArenaManager {
     arenas: Vec<Option<Box<Arena>>>, // slab, stable addresses via Box
-    write_idx: usize,
-    draining: Vec<usize>,  // slab indices, oldest first
-    free_pool: Vec<usize>, // slab indices ready for reuse
+    write_idx: ArenaIdx,
+    draining: Vec<ArenaIdx>,  // slab indices, oldest first
+    free_pool: Vec<ArenaIdx>, // slab indices ready for reuse
+    live_count: usize,        // O(1) count of non-None slab entries
     epoch: u64,
     arena_size: usize,
     page_size: usize,
@@ -49,15 +51,16 @@ impl ArenaManager {
             // Remaining arenas stay in Collected state (default from Arena::new)
             arenas.push(Some(arena));
             if i > 0 {
-                free_pool.push(i);
+                free_pool.push(ArenaIdx::new(i));
             }
         }
 
         Ok(Self {
             arenas,
-            write_idx: 0,
+            write_idx: ArenaIdx::new(0),
             draining: Vec::new(),
             free_pool,
+            live_count: config.initial_arenas,
             epoch: 0,
             arena_size: config.arena_size,
             page_size: config.page_size,
@@ -75,24 +78,31 @@ impl ArenaManager {
         let retired_epoch = self.epoch;
         let new_epoch = retired_epoch + 1;
 
-        // Retire current arena.
-        let current = self.arenas[self.write_idx]
+        // Secure a next arena BEFORE retiring current — if this fails,
+        // the current arena stays writable and no state is mutated.
+        let (next_idx, new_arena_idx) = if let Some(idx) = self.free_pool.pop() {
+            (idx, None)
+        } else {
+            // Try collecting draining arenas first to avoid unnecessary growth.
+            self.collect();
+            if let Some(idx) = self.free_pool.pop() {
+                (idx, None)
+            } else {
+                let idx = self.alloc_arena()?;
+                (idx, Some(idx))
+            }
+        };
+
+        // Now that we have a next arena, retire the current one.
+        let current = self.arenas[self.write_idx.as_usize()]
             .as_ref()
             .expect("write arena missing");
         current.set_state(ArenaState::Retired);
         current.advise_free_unused(self.page_size);
         self.draining.push(self.write_idx);
 
-        // Get next arena from free pool or allocate.
-        let (next_idx, new_arena_idx) = if let Some(idx) = self.free_pool.pop() {
-            (idx, None)
-        } else {
-            let idx = self.alloc_arena()?;
-            (idx, Some(idx))
-        };
-
         // Prepare the new writable arena.
-        let next = self.arenas[next_idx]
+        let next = self.arenas[next_idx.as_usize()]
             .as_ref()
             .expect("free/new arena missing");
         next.reset();
@@ -114,22 +124,19 @@ impl ArenaManager {
     /// number of arenas collected.
     pub fn collect(&mut self) -> usize {
         let mut collected = 0;
-        let mut still_draining = Vec::new();
-
-        for idx in self.draining.drain(..) {
-            let arena = self.arenas[idx]
-                .as_ref()
-                .expect("draining arena missing");
+        let arenas = &self.arenas;
+        let free_pool = &mut self.free_pool;
+        self.draining.retain(|&idx| {
+            let arena = arenas[idx.as_usize()].as_ref().expect("draining arena missing");
             if arena.lease_count() == 0 {
                 arena.set_state(ArenaState::Collected);
-                self.free_pool.push(idx);
+                free_pool.push(idx);
                 collected += 1;
+                false // remove from draining
             } else {
-                still_draining.push(idx);
+                true // keep in draining
             }
-        }
-
-        self.draining = still_draining;
+        });
         collected
     }
 
@@ -141,7 +148,8 @@ impl ArenaManager {
         let mut removed = 0;
         while self.free_pool.len() > self.max_free {
             let idx = self.free_pool.pop().unwrap();
-            self.arenas[idx] = None;
+            self.arenas[idx.as_usize()] = None;
+            self.live_count -= 1;
             removed += 1;
         }
         removed
@@ -149,19 +157,19 @@ impl ArenaManager {
 
     /// Reference to the current writable arena.
     pub fn current_arena(&self) -> &Arena {
-        self.arenas[self.write_idx]
+        self.arenas[self.write_idx.as_usize()]
             .as_ref()
             .expect("write arena missing")
     }
 
     /// Slab index of the current writable arena.
-    pub fn current_arena_idx(&self) -> usize {
+    pub fn current_arena_idx(&self) -> ArenaIdx {
         self.write_idx
     }
 
     /// Look up an arena by slab index.
-    pub fn arena_at(&self, idx: usize) -> Option<&Arena> {
-        self.arenas.get(idx).and_then(|slot| slot.as_ref().map(|b| &**b))
+    pub fn arena_at(&self, idx: ArenaIdx) -> Option<&Arena> {
+        self.arenas.get(idx.as_usize()).and_then(|slot| slot.as_ref().map(|b| &**b))
     }
 
     /// Current epoch number.
@@ -170,11 +178,11 @@ impl ArenaManager {
     }
 
     /// Iterate all live (non-None) arenas with their slab indices.
-    pub fn live_arenas(&self) -> impl Iterator<Item = (usize, &Arena)> {
+    pub fn live_arenas(&self) -> impl Iterator<Item = (ArenaIdx, &Arena)> {
         self.arenas
             .iter()
             .enumerate()
-            .filter_map(|(i, slot)| slot.as_ref().map(|b| (i, &**b)))
+            .filter_map(|(i, slot)| slot.as_ref().map(|b| (ArenaIdx::new(i), &**b)))
     }
 
     /// Number of arenas in the drain queue.
@@ -190,28 +198,27 @@ impl ArenaManager {
     /// Allocate a new arena and insert it into the slab.
     ///
     /// Returns the slab index. Fails if `max_total_arenas` would be exceeded.
-    fn alloc_arena(&mut self) -> Result<usize> {
-        if self.max_arenas > 0 {
-            let current = self.arenas.iter().filter(|s| s.is_some()).count();
-            if current >= self.max_arenas {
-                return Err(TurbineError::ArenaLimitExceeded {
-                    current,
-                    max: self.max_arenas,
-                });
-            }
+    fn alloc_arena(&mut self) -> Result<ArenaIdx> {
+        if self.max_arenas > 0 && self.live_count >= self.max_arenas {
+            return Err(TurbineError::ArenaLimitExceeded {
+                current: self.live_count,
+                max: self.max_arenas,
+            });
         }
 
         let arena = Box::new(Arena::new(self.arena_size)?);
 
         // Find first None slot or push.
-        if let Some(idx) = self.arenas.iter().position(|s| s.is_none()) {
+        let idx = if let Some(idx) = self.arenas.iter().position(|s| s.is_none()) {
             self.arenas[idx] = Some(arena);
-            Ok(idx)
+            idx
         } else {
             let idx = self.arenas.len();
             self.arenas.push(Some(arena));
-            Ok(idx)
-        }
+            idx
+        };
+        self.live_count += 1;
+        Ok(ArenaIdx::new(idx))
     }
 }
 
@@ -234,7 +241,7 @@ mod tests {
     fn new_creates_initial_arenas() {
         let mgr = ArenaManager::new(&test_config()).unwrap();
         assert_eq!(mgr.epoch(), 0);
-        assert_eq!(mgr.current_arena_idx(), 0);
+        assert_eq!(mgr.current_arena_idx(), ArenaIdx::new(0));
         assert_eq!(mgr.current_arena().state(), ArenaState::Writable);
         assert_eq!(mgr.current_arena().epoch(), 0);
         assert_eq!(mgr.free_count(), 2); // 3 initial - 1 writable
@@ -277,7 +284,7 @@ mod tests {
         assert_eq!(result.new_epoch, 1);
 
         // Old arena is draining with leases still held.
-        let old = mgr.arena_at(0).unwrap();
+        let old = mgr.arena_at(ArenaIdx::new(0)).unwrap();
         assert_eq!(old.state(), ArenaState::Retired);
         assert_eq!(old.lease_count(), 2);
 
@@ -318,9 +325,15 @@ mod tests {
         let mut mgr = ArenaManager::new(&config).unwrap();
         assert_eq!(mgr.free_count(), 0);
 
+        // Hold a lease so auto-collect in rotate() can't recycle the retired arena.
+        mgr.current_arena().acquire_lease();
+
         let result = mgr.rotate().unwrap();
         assert!(result.new_arena_idx.is_some()); // had to allocate
         assert_eq!(mgr.live_arenas().count(), 2);
+
+        // Clean up lease.
+        mgr.arena_at(ArenaIdx::new(0)).unwrap().release_lease();
     }
 
     #[test]
@@ -335,30 +348,40 @@ mod tests {
         };
         let mut mgr = ArenaManager::new(&config).unwrap();
 
+        // Hold lease on arena 0 before rotating it away.
+        mgr.arena_at(ArenaIdx::new(0)).unwrap().acquire_lease();
+
         // Use the one free arena.
         mgr.rotate().unwrap();
         assert_eq!(mgr.free_count(), 0);
 
-        // Hold leases so collect won't free anything.
-        mgr.arena_at(0).unwrap().acquire_lease();
+        // Hold lease on arena 1 (current) so auto-collect can't recycle it either.
+        mgr.current_arena().acquire_lease();
 
-        // Next rotate: no free arenas, at max_arenas limit → error.
+        // Next rotate: no free arenas, auto-collect finds nothing, at max_arenas limit → error.
         let err = mgr.rotate().unwrap_err();
         assert!(
             matches!(err, TurbineError::ArenaLimitExceeded { current: 2, max: 2 }),
             "expected ArenaLimitExceeded, got: {err:?}"
         );
 
-        // Clean up lease to avoid debug_assert on drop.
-        mgr.arena_at(0).unwrap().release_lease();
+        // Clean up leases to avoid debug_assert on drop.
+        mgr.arena_at(ArenaIdx::new(0)).unwrap().release_lease();
+        mgr.arena_at(ArenaIdx::new(1)).unwrap().release_lease();
     }
 
     #[test]
     fn collect_moves_zero_lease_to_free() {
         let mut mgr = ArenaManager::new(&test_config()).unwrap();
+
+        // Hold a lease so auto-collect in rotate() doesn't collect arena 0.
+        mgr.current_arena().acquire_lease();
         mgr.rotate().unwrap();
 
         assert_eq!(mgr.draining_count(), 1);
+
+        // Release the lease, then collect explicitly.
+        mgr.arena_at(ArenaIdx::new(0)).unwrap().release_lease();
         let collected = mgr.collect();
         assert_eq!(collected, 1);
         assert_eq!(mgr.draining_count(), 0);
@@ -378,7 +401,7 @@ mod tests {
         assert_eq!(mgr.draining_count(), 1);
 
         // Release the lease, now it should collect.
-        mgr.arena_at(0).unwrap().release_lease();
+        mgr.arena_at(ArenaIdx::new(0)).unwrap().release_lease();
         let collected = mgr.collect();
         assert_eq!(collected, 1);
         assert_eq!(mgr.draining_count(), 0);
@@ -396,9 +419,18 @@ mod tests {
         };
         let mut mgr = ArenaManager::new(&config).unwrap();
 
-        // Rotate several times, then collect to fill free pool.
+        // Hold leases during rotations so auto-collect can't recycle them.
+        let mut leased_indices = Vec::new();
         for _ in 0..4 {
+            let idx = mgr.current_arena_idx();
+            mgr.current_arena().acquire_lease();
+            leased_indices.push(idx);
             mgr.rotate().unwrap();
+        }
+
+        // Release all leases, then collect to fill free pool.
+        for idx in &leased_indices {
+            mgr.arena_at(*idx).unwrap().release_lease();
         }
         mgr.collect();
         let free_before = mgr.free_count();
@@ -424,7 +456,7 @@ mod tests {
         }
 
         // Original arena is still at the same address (Box ensures stability).
-        let arena_ref = mgr.arena_at(0).unwrap();
+        let arena_ref = mgr.arena_at(ArenaIdx::new(0)).unwrap();
         assert_eq!(arena_ref as *const Arena, arena_ptr);
 
         // Data pointer is still valid (arena memory hasn't moved).
@@ -434,6 +466,47 @@ mod tests {
         }
 
         arena_ref.release_lease();
+    }
+
+    #[test]
+    fn collect_partial_draining() {
+        let config = PoolConfig {
+            arena_size: 4096,
+            initial_arenas: 4,
+            max_free_arenas: 8,
+            max_total_arenas: 0,
+            registration_slots: 32,
+            page_size: 4096,
+        };
+        let mut mgr = ArenaManager::new(&config).unwrap();
+
+        // Rotate 3 times, holding leases on odd-epoch arenas.
+        // Arena 0 (epoch 0): acquire lease
+        mgr.current_arena().acquire_lease();
+        mgr.rotate().unwrap(); // epoch 0 → draining
+
+        // Arena 1 (epoch 1): no lease
+        mgr.rotate().unwrap(); // epoch 1 → draining
+
+        // Arena 2 (epoch 2): acquire lease
+        mgr.current_arena().acquire_lease();
+        mgr.rotate().unwrap(); // epoch 2 → draining
+
+        assert_eq!(mgr.draining_count(), 3);
+
+        // Collect should only free the arena with no leases (epoch 1).
+        let collected = mgr.collect();
+        assert_eq!(collected, 1);
+        assert_eq!(mgr.draining_count(), 2); // arenas 0 and 2 still draining
+
+        // Clean up leases.
+        mgr.arena_at(ArenaIdx::new(0)).unwrap().release_lease();
+        mgr.arena_at(ArenaIdx::new(2)).unwrap().release_lease();
+
+        // Now collect should free both.
+        let collected = mgr.collect();
+        assert_eq!(collected, 2);
+        assert_eq!(mgr.draining_count(), 0);
     }
 
     #[test]
@@ -448,17 +521,24 @@ mod tests {
         };
         let mut mgr = ArenaManager::new(&config).unwrap();
 
+        // Hold leases so auto-collect can't recycle during rotate.
+        mgr.current_arena().acquire_lease(); // arena 0
+
         // Rotate: retire epoch 0.
         let r = mgr.rotate().unwrap();
         assert_eq!(r.retired_epoch, 0);
         assert_eq!(r.new_epoch, 1);
 
-        // Rotate again: free pool empty → alloc new.
+        mgr.current_arena().acquire_lease(); // arena 1
+
+        // Rotate again: free pool empty, auto-collect finds nothing (leases held) → alloc new.
         let r = mgr.rotate().unwrap();
         assert_eq!(r.retired_epoch, 1);
         assert!(r.new_arena_idx.is_some());
 
-        // Collect: both retired arenas have no leases.
+        // Release leases, then collect: both retired arenas have no leases.
+        mgr.arena_at(ArenaIdx::new(0)).unwrap().release_lease();
+        mgr.arena_at(ArenaIdx::new(1)).unwrap().release_lease();
         let collected = mgr.collect();
         assert_eq!(collected, 2);
         assert_eq!(mgr.free_count(), 2);

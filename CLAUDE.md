@@ -13,11 +13,12 @@ lore/             # Implementation notes and research documents
 
 ## Key Modules (turbine-core)
 
+- `types.rs` — `ArenaIdx`, `SlotId`: newtype wrappers for type-safe arena slab indices and io_uring slot IDs
 - `buffer/pool.rs` — `IouringBufferPool`: main API, owns ArenaManager + channel, UnsafeCell interior mutability
-- `buffer/leased.rs` — `LeasedBuffer`: !Send buffer with arena lease, `slot_id` for io_uring, `into_sendable()` for cross-thread
-- `buffer/pinned.rs` — `PinnedWrite`: borrow guard for io_uring submission, `buf_index()` returns slot_id
-- `epoch/manager.rs` — `ArenaManager`: slab-based arena management with drain queue and free pool
-- `epoch/arena.rs` — `Arena`: mmap'd bump allocator, lease counting via `Cell<usize>`, `advise_free_unused()` for madvise
+- `buffer/leased.rs` — `LeasedBuffer`: !Send buffer with arena lease, `SlotId` for io_uring, `into_sendable()` for cross-thread
+- `buffer/pinned.rs` — `PinnedWrite`: borrow guard for io_uring submission, `buf_index()` returns `SlotId`
+- `epoch/manager.rs` — `ArenaManager`: slab-based arena management with drain queue and free pool, auto-collect on rotate
+- `epoch/arena.rs` — `Arena`: mmap'd bump allocator, lease counting via `Cell<usize>`, `advise_free_unused()` for madvise (warns on failure)
 - `transfer/handle.rs` — `TransferHandle` + `SendableBuffer`: cross-thread buffer transfer
 - `ring/registration.rs` — `RingRegistration`: slot allocator + arena-to-slot mapping for io_uring
 - `config.rs` — `PoolConfig`: arena size, initial count, max free/total arenas, registration slots, page size
@@ -36,12 +37,15 @@ cargo clippy --workspace
 These are load-bearing and must not be weakened:
 
 1. `rotate()` never blocks — retired arenas go to drain queue, only recycled after `collect()` confirms 0 leases
-2. `LeasedBuffer` and `IouringBufferPool` are `!Send` (enforced via `PhantomData<Rc<()>>`)
-3. `SendableBuffer::new()` is `pub(crate)` — must go through `into_sendable()`
-4. `into_sendable()` uses `ManuallyDrop` to transfer lease ownership without double-decrement
-5. `drain_returns()` uses arena slab index (not epoch scan) with epoch sanity check
-6. Arena `Drop` has `debug_assert` for leaked leases
-7. Arenas stored as `Box<Arena>` in slab — pointer stability guaranteed across Vec growth
+2. `rotate()` secures next arena BEFORE retiring current — on failure, no state is mutated
+3. `rotate()` auto-collects draining arenas when free pool is empty before allocating new
+4. `LeasedBuffer` and `IouringBufferPool` are `!Send` (enforced via `PhantomData<Rc<()>>`)
+5. `SendableBuffer::new()` is `pub(crate)` — must go through `into_sendable()`
+6. `into_sendable()` uses `ManuallyDrop` to transfer lease ownership without double-decrement
+7. `drain_returns()` uses `ArenaIdx` (not epoch scan) with epoch sanity check
+8. Arena `Drop` has `debug_assert` for leaked leases
+9. Arenas stored as `Box<Arena>` in slab — pointer stability guaranteed across Vec growth
+10. `ArenaIdx` and `SlotId` newtypes prevent mixing arena indices with slot IDs
 
 ## Conventions
 

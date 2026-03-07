@@ -160,11 +160,17 @@ impl Arena {
         let used = self.offset.get();
         let start = (used + page_size - 1) & !(page_size - 1); // align up
         if start < self.capacity {
-            unsafe {
+            let ret = unsafe {
                 libc::madvise(
                     self.base.as_ptr().add(start).cast(),
                     self.capacity - start,
                     libc::MADV_FREE,
+                )
+            };
+            if ret != 0 {
+                tracing::warn!(
+                    error = %std::io::Error::last_os_error(),
+                    "madvise(MADV_FREE) failed"
                 );
             }
         }

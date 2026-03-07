@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::epoch::arena::Arena;
 use crate::error::{Result, TurbineError};
+use crate::{ArenaIdx, SlotId};
 
 /// Bitmap-based slot allocator for io_uring buffer registration slots.
 struct SlotAllocator {
@@ -15,18 +16,18 @@ impl SlotAllocator {
         }
     }
 
-    fn alloc(&mut self) -> Option<u16> {
+    fn alloc(&mut self) -> Option<SlotId> {
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if !*slot {
                 *slot = true;
-                return Some(i as u16);
+                return Some(SlotId::new(i as u16));
             }
         }
         None
     }
 
-    fn free(&mut self, slot: u16) {
-        let idx = slot as usize;
+    fn free(&mut self, slot: SlotId) {
+        let idx = slot.as_u16() as usize;
         debug_assert!(idx < self.slots.len(), "slot index out of bounds");
         debug_assert!(self.slots[idx], "freeing unallocated slot");
         if idx < self.slots.len() {
@@ -43,7 +44,7 @@ impl SlotAllocator {
 pub struct RingRegistration {
     registered: bool,
     slots: SlotAllocator,
-    arena_slot_map: HashMap<usize, u16>, // slab_idx → io_uring slot
+    arena_slot_map: HashMap<ArenaIdx, SlotId>, // slab_idx → io_uring slot
     generation: u64,
 }
 
@@ -62,7 +63,7 @@ impl RingRegistration {
     pub fn register<'a>(
         &mut self,
         submitter: &io_uring::Submitter<'_>,
-        arenas: impl Iterator<Item = (usize, &'a Arena)>,
+        arenas: impl Iterator<Item = (ArenaIdx, &'a Arena)>,
     ) -> Result<()> {
         // Build iovec array with capacity for all slots (empty slots get zeroed iovecs)
         let mut iovecs: Vec<libc::iovec> = vec![
@@ -79,7 +80,7 @@ impl RingRegistration {
                 .alloc()
                 .ok_or(TurbineError::NoRegistrationSlot(slab_idx))?;
             self.arena_slot_map.insert(slab_idx, slot);
-            iovecs[slot as usize] = arena.as_iovec();
+            iovecs[slot.as_u16() as usize] = arena.as_iovec();
         }
 
         unsafe {
@@ -111,7 +112,7 @@ impl RingRegistration {
 
     /// Track a new arena in the slot map (for dynamic growth).
     /// Returns the allocated slot ID.
-    pub fn register_arena(&mut self, slab_idx: usize, _arena: &Arena) -> Result<u16> {
+    pub fn register_arena(&mut self, slab_idx: ArenaIdx) -> Result<SlotId> {
         let slot = self
             .slots
             .alloc()
@@ -122,7 +123,7 @@ impl RingRegistration {
     }
 
     /// Remove an arena from the slot map.
-    pub fn unregister_arena(&mut self, slab_idx: usize) {
+    pub fn unregister_arena(&mut self, slab_idx: ArenaIdx) {
         if let Some(slot) = self.arena_slot_map.remove(&slab_idx) {
             self.slots.free(slot);
             self.generation += 1;
@@ -130,7 +131,7 @@ impl RingRegistration {
     }
 
     /// Look up the io_uring slot for a given arena slab index.
-    pub fn slot_for_arena(&self, slab_idx: usize) -> Option<u16> {
+    pub fn slot_for_arena(&self, slab_idx: ArenaIdx) -> Option<SlotId> {
         self.arena_slot_map.get(&slab_idx).copied()
     }
 
@@ -169,10 +170,10 @@ mod tests {
     #[test]
     fn slot_allocator_sequential() {
         let mut alloc = SlotAllocator::new(4);
-        assert_eq!(alloc.alloc(), Some(0));
-        assert_eq!(alloc.alloc(), Some(1));
-        assert_eq!(alloc.alloc(), Some(2));
-        assert_eq!(alloc.alloc(), Some(3));
+        assert_eq!(alloc.alloc(), Some(SlotId::new(0)));
+        assert_eq!(alloc.alloc(), Some(SlotId::new(1)));
+        assert_eq!(alloc.alloc(), Some(SlotId::new(2)));
+        assert_eq!(alloc.alloc(), Some(SlotId::new(3)));
         assert_eq!(alloc.alloc(), None);
     }
 
@@ -183,47 +184,45 @@ mod tests {
         let _s1 = alloc.alloc().unwrap();
         alloc.free(s0);
         // Should reuse slot 0
-        assert_eq!(alloc.alloc(), Some(0));
+        assert_eq!(alloc.alloc(), Some(SlotId::new(0)));
     }
 
     #[test]
     fn register_arena_tracking() {
         let mut reg = RingRegistration::new(8);
-        let arena = Arena::new(4096).unwrap();
 
-        let slot = reg.register_arena(0, &arena).unwrap();
-        assert_eq!(reg.slot_for_arena(0), Some(slot));
+        let slot = reg.register_arena(ArenaIdx::new(0)).unwrap();
+        assert_eq!(reg.slot_for_arena(ArenaIdx::new(0)), Some(slot));
         assert_eq!(reg.generation(), 1);
 
-        let slot2 = reg.register_arena(1, &arena).unwrap();
+        let slot2 = reg.register_arena(ArenaIdx::new(1)).unwrap();
         assert_ne!(slot, slot2);
-        assert_eq!(reg.slot_for_arena(1), Some(slot2));
+        assert_eq!(reg.slot_for_arena(ArenaIdx::new(1)), Some(slot2));
         assert_eq!(reg.generation(), 2);
     }
 
     #[test]
     fn unregister_arena_frees_slot() {
         let mut reg = RingRegistration::new(2);
-        let arena = Arena::new(4096).unwrap();
 
-        let _s0 = reg.register_arena(0, &arena).unwrap();
-        let _s1 = reg.register_arena(1, &arena).unwrap();
+        let _s0 = reg.register_arena(ArenaIdx::new(0)).unwrap();
+        let _s1 = reg.register_arena(ArenaIdx::new(1)).unwrap();
 
         // All slots full
-        assert!(reg.register_arena(2, &arena).is_err());
+        assert!(reg.register_arena(ArenaIdx::new(2)).is_err());
 
         // Free one
-        reg.unregister_arena(0);
-        assert_eq!(reg.slot_for_arena(0), None);
+        reg.unregister_arena(ArenaIdx::new(0));
+        assert_eq!(reg.slot_for_arena(ArenaIdx::new(0)), None);
 
         // Can allocate again
-        let s2 = reg.register_arena(2, &arena).unwrap();
-        assert_eq!(reg.slot_for_arena(2), Some(s2));
+        let s2 = reg.register_arena(ArenaIdx::new(2)).unwrap();
+        assert_eq!(reg.slot_for_arena(ArenaIdx::new(2)), Some(s2));
     }
 
     #[test]
     fn slot_for_unknown_arena_returns_none() {
         let reg = RingRegistration::new(8);
-        assert_eq!(reg.slot_for_arena(99), None);
+        assert_eq!(reg.slot_for_arena(ArenaIdx::new(99)), None);
     }
 }

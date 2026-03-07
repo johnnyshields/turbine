@@ -11,6 +11,7 @@ use crate::error::{Result, TurbineError};
 use crate::gc::{BufferPinHook, EpochObserver};
 use crate::ring::registration::RingRegistration;
 use crate::transfer::handle::{ReturnedBuffer, TransferHandle};
+use crate::SlotId;
 
 /// The main API for epoch-based io_uring buffer management.
 ///
@@ -84,7 +85,18 @@ impl<H: BufferPinHook + EpochObserver> IouringBufferPool<H> {
         self.hooks.on_pin(arena.epoch(), buf_id);
 
         let arena_idx = mgr.current_arena_idx();
-        let slot_id = self.reg().slot_for_arena(arena_idx).unwrap_or(0);
+        let slot_id = match self.reg().slot_for_arena(arena_idx) {
+            Some(id) => id,
+            None => {
+                if self.reg().is_registered() {
+                    tracing::warn!(
+                        arena_idx = arena_idx.as_usize(),
+                        "arena has no registration slot despite pool being registered"
+                    );
+                }
+                SlotId::new(0)
+            }
+        };
         // SAFETY: ptr points into the arena's mmap region which is valid
         // for the arena's lifetime. The arena outlives the lease because
         // lease_count > 0 prevents collection.
@@ -121,9 +133,7 @@ impl<H: BufferPinHook + EpochObserver> IouringBufferPool<H> {
         self.hooks.on_rotate(result.retired_epoch, result.new_epoch);
 
         if let Some(new_idx) = result.new_arena_idx {
-            if let Some(arena) = self.mgr().arena_at(new_idx) {
-                let _ = self.reg_mut().register_arena(new_idx, arena);
-            }
+            let _ = self.reg_mut().register_arena(new_idx);
             self.hooks.on_arena_alloc(new_idx);
         }
 
@@ -142,7 +152,7 @@ impl<H: BufferPinHook + EpochObserver> IouringBufferPool<H> {
     /// Try to collect (reclaim) the arena that served `epoch`.
     ///
     /// Succeeds if all leases for that epoch have been returned.
-    pub fn try_collect(&self, epoch: u64) -> Result<()> {
+    pub fn collect_epoch(&self, epoch: u64) -> Result<()> {
         let mgr = self.mgr();
         let arena = mgr
             .live_arenas()
@@ -191,7 +201,7 @@ impl<H: BufferPinHook + EpochObserver> IouringBufferPool<H> {
                     tracing::error!(
                         expected_epoch = ret.epoch,
                         actual_epoch = arena.epoch(),
-                        arena_idx = ret.arena_idx,
+                        arena_idx = ret.arena_idx.as_usize(),
                         "arena epoch mismatch in drain_returns"
                     );
                     continue;
@@ -201,7 +211,7 @@ impl<H: BufferPinHook + EpochObserver> IouringBufferPool<H> {
                 count += 1;
             } else {
                 tracing::error!(
-                    arena_idx = ret.arena_idx,
+                    arena_idx = ret.arena_idx.as_usize(),
                     epoch = ret.epoch,
                     "received return for unknown arena index"
                 );
@@ -294,11 +304,11 @@ mod tests {
         pool.rotate().unwrap();
 
         // Can't collect epoch 0 — still has a lease.
-        assert!(pool.try_collect(0).is_err());
+        assert!(pool.collect_epoch(0).is_err());
 
         drop(buf);
 
-        pool.try_collect(0).unwrap();
+        pool.collect_epoch(0).unwrap();
     }
 
     #[test]
@@ -379,14 +389,39 @@ mod tests {
 
         pool.rotate().unwrap();
 
-        assert!(pool.try_collect(epoch).is_err());
+        assert!(pool.collect_epoch(epoch).is_err());
 
         drop(sendable);
 
         let drained = pool.drain_returns();
         assert_eq!(drained, 1);
 
-        pool.try_collect(epoch).unwrap();
+        pool.collect_epoch(epoch).unwrap();
+    }
+
+    #[test]
+    fn shrink_cleans_up_arenas() {
+        let config = PoolConfig {
+            arena_size: 4096,
+            initial_arenas: 5,
+            max_free_arenas: 1,
+            max_total_arenas: 0,
+            registration_slots: 32,
+            page_size: 4096,
+        };
+        let pool = IouringBufferPool::new(config, NoopHooks).unwrap();
+
+        // Use up arenas via rotation.
+        pool.rotate().unwrap();
+        pool.rotate().unwrap();
+
+        // Collect draining arenas back to free pool.
+        let collected = pool.collect();
+        assert!(collected >= 2);
+
+        // Shrink should remove excess free arenas.
+        let removed = pool.shrink();
+        assert!(removed > 0, "should have removed excess free arenas");
     }
 
     /// Compile-time assertion that IouringBufferPool is !Send.

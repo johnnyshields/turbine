@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::ArenaIdx;
+
 /// Errors produced by turbine buffer operations.
 #[derive(Debug, Error)]
 pub enum TurbineError {
@@ -28,7 +30,7 @@ pub enum TurbineError {
     ArenaLimitExceeded { current: usize, max: usize },
 
     #[error("no registration slot available for arena {0}")]
-    NoRegistrationSlot(usize),
+    NoRegistrationSlot(ArenaIdx),
 
     #[error("madvise failed: {0}")]
     Madvise(std::io::Error),
@@ -110,7 +112,7 @@ mod tests {
 
     #[test]
     fn no_registration_slot_display() {
-        let e = TurbineError::NoRegistrationSlot(5);
+        let e = TurbineError::NoRegistrationSlot(ArenaIdx::new(5));
         let msg = format!("{e}");
         assert!(msg.contains("5"));
         assert!(msg.contains("registration slot"));

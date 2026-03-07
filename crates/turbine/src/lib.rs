@@ -8,6 +8,7 @@ pub use turbine_core::error::{Result, TurbineError};
 pub use turbine_core::gc::{BufferPinHook, EpochObserver, NoopHooks};
 pub use turbine_core::ring::registration::RingRegistration;
 pub use turbine_core::transfer::handle::{ReturnedBuffer, SendableBuffer, TransferHandle};
+pub use turbine_core::{ArenaIdx, SlotId};
 
 /// Convenience re-exports.
 pub mod prelude {

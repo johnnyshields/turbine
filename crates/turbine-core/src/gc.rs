@@ -1,3 +1,5 @@
+use crate::ArenaIdx;
+
 /// Hook called when buffers are pinned or released.
 ///
 /// Implement this to track buffer lifecycle events for garbage collection,
@@ -19,10 +21,10 @@ pub trait EpochObserver {
     fn on_collect(&self, epoch: u64);
 
     /// Called when a new arena is allocated.
-    fn on_arena_alloc(&self, _arena_idx: usize) {}
+    fn on_arena_alloc(&self, _arena_idx: ArenaIdx) {}
 
     /// Called when an arena is freed (munmapped).
-    fn on_arena_free(&self, _arena_idx: usize) {}
+    fn on_arena_free(&self, _arena_idx: ArenaIdx) {}
 
     /// Called after a collect sweep with the number of arenas collected.
     fn on_collect_sweep(&self, _collected: usize) {}

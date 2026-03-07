@@ -1,4 +1,5 @@
 use crate::buffer::leased::LeasedBuffer;
+use crate::SlotId;
 
 /// A borrow guard that pins a `LeasedBuffer` during io_uring submission.
 ///
@@ -35,7 +36,7 @@ impl<'a> PinnedWrite<'a> {
     }
 
     /// The io_uring registration slot index for fixed-buffer operations.
-    pub fn buf_index(&self) -> u16 {
+    pub fn buf_index(&self) -> SlotId {
         self.buffer.slot_id()
     }
 }
@@ -44,6 +45,7 @@ impl<'a> PinnedWrite<'a> {
 mod tests {
     use super::*;
     use crate::epoch::arena::{Arena, ArenaState};
+    use crate::ArenaIdx;
 
     #[test]
     fn pinned_write_accessors() {
@@ -54,12 +56,12 @@ mod tests {
         let (ptr, buf_id) = arena.alloc(128).unwrap();
         arena.acquire_lease();
 
-        let mut buf = unsafe { LeasedBuffer::new(ptr, 128, 1, buf_id, 0, &arena as *const Arena, 0) };
+        let mut buf = unsafe { LeasedBuffer::new(ptr, 128, 1, buf_id, SlotId::new(0), &arena as *const Arena, ArenaIdx::new(0)) };
 
         let mut pinned = buf.pin_for_write();
         assert_eq!(pinned.len(), 128);
         assert!(!pinned.is_empty());
-        assert_eq!(pinned.buf_index(), 0);
+        assert_eq!(pinned.buf_index(), SlotId::new(0));
         assert!(!pinned.as_ptr().is_null());
         assert!(!pinned.as_mut_ptr().is_null());
     }
@@ -73,7 +75,7 @@ mod tests {
         let (ptr, buf_id) = arena.alloc(0).unwrap();
         arena.acquire_lease();
 
-        let mut buf = unsafe { LeasedBuffer::new(ptr, 0, 1, buf_id, 0, &arena as *const Arena, 0) };
+        let mut buf = unsafe { LeasedBuffer::new(ptr, 0, 1, buf_id, SlotId::new(0), &arena as *const Arena, ArenaIdx::new(0)) };
 
         let pinned = buf.pin_for_write();
         assert!(pinned.is_empty());
