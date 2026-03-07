@@ -89,6 +89,20 @@ serialization between processes.
 No io_uring, no zero-copy, significant serialization overhead. Not a
 relevant comparison for buffer management.
 
+### Rebar
+
+BEAM-inspired distributed actor runtime for Rust with lightweight processes,
+supervision trees (OneForOne, OneForAll, RestForOne), mailbox messaging, and
+SWIM-based cluster discovery. Currently built on Tokio.
+
+**Differentiation:** Rebar is the closest thing to a Rust BEAM and a natural
+integration target for Turbine. It currently uses Tokio's I/O model; adding
+io_uring with Turbine as the buffer layer would give it fixed-buffer
+registration and zero-contention allocation on the I/O hot path, without
+abandoning its work-stealing scheduler. Cross-thread buffer transfer via
+Turbine's split-counter maps directly onto Rebar's inter-scheduler message
+passing.
+
 ## Why This Hasn't Been Done Before
 
 1. **The problem is narrow.** Most io_uring users don't hit buffer allocation

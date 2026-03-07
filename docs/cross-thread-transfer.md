@@ -14,7 +14,8 @@ Thread-per-core runtimes (Monoio, Glommio) avoid cross-thread sharing entirely.
 Buffers stay on one core, period. This works for uniform request handlers but
 breaks down when:
 
-- A BEAM-like scheduler migrates processes between scheduler threads
+- A BEAM-like scheduler (e.g. [Rebar](https://github.com/alexandernicholson/rebar))
+  migrates processes between scheduler threads
 - A pipeline architecture passes data from I/O threads to compute threads
 - A fan-out pattern distributes work from one receiver to N workers
 

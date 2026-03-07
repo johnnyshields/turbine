@@ -28,7 +28,9 @@ no sharing, no migration. This is ideal for uniform network proxies but
 fundamentally incompatible with the BEAM model, where any process can message
 any other process regardless of which scheduler thread it runs on.
 
-A BEAM-like runtime on io_uring needs **efficient cross-thread buffer sharing**.
+A BEAM-like runtime (e.g.
+[Rebar](https://github.com/alexandernicholson/rebar)) needs **efficient
+cross-thread buffer sharing** if using io_uring.
 Processes on thread A produce I/O buffers that processes on thread B consume.
 Neither the thread-per-core "no sharing" model nor Tokio's "Arc\<Mutex\<>>"
 approach is satisfactory:

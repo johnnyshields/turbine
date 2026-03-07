@@ -114,8 +114,10 @@ pool.collect();
 
 ## With a BEAM-like Runtime
 
-Turbine was designed with BEAM-style concurrency in mind. The key integration
-points:
+Turbine was designed with BEAM-style concurrency in mind. Runtimes like
+[Rebar](https://github.com/alexandernicholson/rebar) -- a BEAM-inspired
+distributed actor runtime for Rust -- are a natural fit.
+The key integration points:
 
 ### Per-Scheduler-Thread Pools
 
