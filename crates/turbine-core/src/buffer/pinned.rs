@@ -16,26 +16,31 @@ impl<'a> PinnedWrite<'a> {
     }
 
     /// Raw pointer to the start of the buffer (for io_uring SQE).
+    #[inline]
     pub fn as_ptr(&self) -> *const u8 {
         self.buffer.as_slice().as_ptr()
     }
 
     /// Mutable raw pointer to the start of the buffer.
+    #[inline]
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self.buffer.as_mut_slice().as_mut_ptr()
     }
 
     /// Length of the pinned buffer in bytes.
+    #[inline]
     pub fn len(&self) -> usize {
         self.buffer.len()
     }
 
     /// Returns `true` if the pinned buffer has zero length.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }
 
     /// The io_uring registration slot index for fixed-buffer operations.
+    #[inline]
     pub fn buf_index(&self) -> SlotId {
         self.buffer.slot_id()
     }

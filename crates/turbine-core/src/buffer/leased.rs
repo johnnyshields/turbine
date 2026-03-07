@@ -70,31 +70,37 @@ impl LeasedBuffer {
     }
 
     /// The epoch this buffer belongs to.
+    #[inline]
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
 
     /// The buffer ID within the arena.
+    #[inline]
     pub fn buf_id(&self) -> u32 {
         self.buf_id
     }
 
     /// The index of the arena in the slab.
+    #[inline]
     pub fn arena_idx(&self) -> ArenaIdx {
         self.arena_idx
     }
 
     /// The io_uring registration slot for this buffer's arena.
+    #[inline]
     pub fn slot_id(&self) -> SlotId {
         self.slot_id
     }
 
     /// Length of the buffer in bytes.
+    #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Returns `true` if the buffer has zero length.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }

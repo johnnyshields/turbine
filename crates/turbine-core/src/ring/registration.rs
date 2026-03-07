@@ -10,6 +10,7 @@ struct SlotAllocator {
 
 impl SlotAllocator {
     fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "SlotAllocator requires at least 1 slot");
         assert!(capacity <= 64, "SlotAllocator supports at most 64 slots");
         Self {
             bitmap: 0,
@@ -242,5 +243,68 @@ mod tests {
     fn slot_for_unknown_arena_returns_none() {
         let reg = RingRegistration::new(8);
         assert_eq!(reg.slot_for_arena(ArenaIdx::new(99)), None);
+    }
+
+    #[test]
+    fn slot_allocator_capacity_one() {
+        let mut alloc = SlotAllocator::new(1);
+        assert_eq!(alloc.alloc(), Some(SlotId::new(0)));
+        assert_eq!(alloc.alloc(), None);
+        alloc.free(SlotId::new(0));
+        assert_eq!(alloc.alloc(), Some(SlotId::new(0)));
+    }
+
+    #[test]
+    fn slot_allocator_capacity_64() {
+        let mut alloc = SlotAllocator::new(64);
+        let mut slots = Vec::new();
+        for i in 0..64 {
+            let s = alloc.alloc().unwrap();
+            assert_eq!(s.as_u16(), i as u16);
+            slots.push(s);
+        }
+        assert_eq!(alloc.alloc(), None);
+
+        // Free all and reallocate
+        for s in &slots {
+            alloc.free(*s);
+        }
+        for i in 0..64 {
+            let s = alloc.alloc().unwrap();
+            assert_eq!(s.as_u16(), i as u16);
+        }
+        assert_eq!(alloc.alloc(), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "SlotAllocator requires at least 1 slot")]
+    fn slot_allocator_capacity_zero_panics() {
+        SlotAllocator::new(0);
+    }
+
+    #[test]
+    fn arena_slot_map_sparse_indices() {
+        let mut reg = RingRegistration::new(8);
+
+        let s0 = reg.register_arena(ArenaIdx::new(0)).unwrap();
+        let s50 = reg.register_arena(ArenaIdx::new(50)).unwrap();
+        let s99 = reg.register_arena(ArenaIdx::new(99)).unwrap();
+
+        assert_eq!(reg.slot_for_arena(ArenaIdx::new(0)), Some(s0));
+        assert_eq!(reg.slot_for_arena(ArenaIdx::new(50)), Some(s50));
+        assert_eq!(reg.slot_for_arena(ArenaIdx::new(99)), Some(s99));
+
+        // Gaps should be None
+        assert_eq!(reg.slot_for_arena(ArenaIdx::new(25)), None);
+        assert_eq!(reg.slot_for_arena(ArenaIdx::new(75)), None);
+
+        // Vec grew to accommodate index 99
+        assert!(reg.arena_slot_map.len() >= 100);
+
+        // Unregister middle, verify others unchanged
+        reg.unregister_arena(ArenaIdx::new(50));
+        assert_eq!(reg.slot_for_arena(ArenaIdx::new(50)), None);
+        assert_eq!(reg.slot_for_arena(ArenaIdx::new(0)), Some(s0));
+        assert_eq!(reg.slot_for_arena(ArenaIdx::new(99)), Some(s99));
     }
 }
