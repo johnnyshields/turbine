@@ -16,6 +16,8 @@ pub struct LeasedBuffer {
     len: usize,
     epoch: u64,
     buf_id: u32,
+    /// io_uring registration slot for this buffer's arena.
+    slot_id: u16,
     /// Raw pointer back to the arena for lease release on Drop.
     arena: *const Arena,
     arena_idx: usize,
@@ -35,6 +37,7 @@ impl LeasedBuffer {
         len: usize,
         epoch: u64,
         buf_id: u32,
+        slot_id: u16,
         arena: *const Arena,
         arena_idx: usize,
     ) -> Self {
@@ -43,6 +46,7 @@ impl LeasedBuffer {
             len,
             epoch,
             buf_id,
+            slot_id,
             arena,
             arena_idx,
             _not_send: PhantomData,
@@ -74,9 +78,14 @@ impl LeasedBuffer {
         self.buf_id
     }
 
-    /// The index of the arena in the epoch clock ring.
+    /// The index of the arena in the slab.
     pub fn arena_idx(&self) -> usize {
         self.arena_idx
+    }
+
+    /// The io_uring registration slot for this buffer's arena.
+    pub fn slot_id(&self) -> u16 {
+        self.slot_id
     }
 
     /// Length of the buffer in bytes.
@@ -144,7 +153,7 @@ mod tests {
             std::ptr::write_bytes(ptr, 0xAB, 64);
         }
 
-        let buf = unsafe { LeasedBuffer::new(ptr, 64, 1, buf_id, &arena as *const Arena, 0) };
+        let buf = unsafe { LeasedBuffer::new(ptr, 64, 1, buf_id, 0, &arena as *const Arena, 0) };
 
         assert_eq!(buf.len(), 64);
         assert!(!buf.is_empty());
@@ -167,7 +176,7 @@ mod tests {
         let (ptr, buf_id) = arena.alloc(16).unwrap();
         arena.acquire_lease();
 
-        let mut buf = unsafe { LeasedBuffer::new(ptr, 16, 1, buf_id, &arena as *const Arena, 0) };
+        let mut buf = unsafe { LeasedBuffer::new(ptr, 16, 1, buf_id, 0, &arena as *const Arena, 0) };
         buf.as_mut_slice().copy_from_slice(&[1u8; 16]);
         assert!(buf.as_slice().iter().all(|&b| b == 1));
     }
@@ -184,7 +193,7 @@ mod tests {
 
         {
             let _buf =
-                unsafe { LeasedBuffer::new(ptr, 32, 1, buf_id, &arena as *const Arena, 0) };
+                unsafe { LeasedBuffer::new(ptr, 32, 1, buf_id, 0, &arena as *const Arena, 0) };
             assert_eq!(arena.lease_count(), 1);
         }
         // After drop, lease count should be decremented.
@@ -201,7 +210,7 @@ mod tests {
         let (ptr, buf_id) = arena.alloc(0).unwrap();
         arena.acquire_lease();
 
-        let buf = unsafe { LeasedBuffer::new(ptr, 0, 1, buf_id, &arena as *const Arena, 0) };
+        let buf = unsafe { LeasedBuffer::new(ptr, 0, 1, buf_id, 0, &arena as *const Arena, 0) };
         assert!(buf.is_empty());
         assert_eq!(buf.len(), 0);
         assert_eq!(buf.as_slice(), &[]);
@@ -216,7 +225,7 @@ mod tests {
         let (ptr, buf_id) = arena.alloc(64).unwrap();
         arena.acquire_lease();
 
-        let mut buf = unsafe { LeasedBuffer::new(ptr, 64, 1, buf_id, &arena as *const Arena, 0) };
+        let mut buf = unsafe { LeasedBuffer::new(ptr, 64, 1, buf_id, 0, &arena as *const Arena, 0) };
         {
             let pinned = buf.pin_for_write();
             assert_eq!(pinned.len(), 64);
@@ -238,7 +247,7 @@ mod tests {
         let (ptr, buf_id) = arena.alloc(64).unwrap();
         arena.acquire_lease();
 
-        let buf = unsafe { LeasedBuffer::new(ptr, 64, 1, buf_id, &arena as *const Arena, 0) };
+        let buf = unsafe { LeasedBuffer::new(ptr, 64, 1, buf_id, 0, &arena as *const Arena, 0) };
 
         let (tx, rx) = unbounded();
         let handle = TransferHandle::new(tx);

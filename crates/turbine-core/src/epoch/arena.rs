@@ -154,6 +154,22 @@ impl Arena {
         self.base.as_ptr()
     }
 
+    /// Hint to OS that unused pages can be reclaimed.
+    /// Called when arena enters draining state.
+    pub fn advise_free_unused(&self, page_size: usize) {
+        let used = self.offset.get();
+        let start = (used + page_size - 1) & !(page_size - 1); // align up
+        if start < self.capacity {
+            unsafe {
+                libc::madvise(
+                    self.base.as_ptr().add(start).cast(),
+                    self.capacity - start,
+                    libc::MADV_FREE,
+                );
+            }
+        }
+    }
+
     /// Return an iovec describing the entire arena.
     pub fn as_iovec(&self) -> libc::iovec {
         libc::iovec {

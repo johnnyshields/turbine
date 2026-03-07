@@ -17,6 +17,15 @@ pub trait EpochObserver {
 
     /// Called when a retired epoch's arena is reclaimed.
     fn on_collect(&self, epoch: u64);
+
+    /// Called when a new arena is allocated.
+    fn on_arena_alloc(&self, _arena_idx: usize) {}
+
+    /// Called when an arena is freed (munmapped).
+    fn on_arena_free(&self, _arena_idx: usize) {}
+
+    /// Called after a collect sweep with the number of arenas collected.
+    fn on_collect_sweep(&self, _collected: usize) {}
 }
 
 /// No-op implementations of all hooks, for standalone use.

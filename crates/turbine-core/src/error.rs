@@ -24,6 +24,15 @@ pub enum TurbineError {
     #[error("io_uring buffer registration failed: {0}")]
     Registration(std::io::Error),
 
+    #[error("arena limit exceeded: {current} arenas, max {max}")]
+    ArenaLimitExceeded { current: usize, max: usize },
+
+    #[error("no registration slot available for arena {0}")]
+    NoRegistrationSlot(usize),
+
+    #[error("madvise failed: {0}")]
+    Madvise(std::io::Error),
+
     #[error("pool configuration invalid: {0}")]
     InvalidConfig(String),
 }
@@ -88,6 +97,30 @@ mod tests {
         let e = TurbineError::Registration(std::io::Error::new(std::io::ErrorKind::Other, "fail"));
         let msg = format!("{e}");
         assert!(msg.contains("registration"));
+        assert!(msg.contains("fail"));
+    }
+
+    #[test]
+    fn arena_limit_exceeded_display() {
+        let e = TurbineError::ArenaLimitExceeded { current: 10, max: 8 };
+        let msg = format!("{e}");
+        assert!(msg.contains("10"));
+        assert!(msg.contains("8"));
+    }
+
+    #[test]
+    fn no_registration_slot_display() {
+        let e = TurbineError::NoRegistrationSlot(5);
+        let msg = format!("{e}");
+        assert!(msg.contains("5"));
+        assert!(msg.contains("registration slot"));
+    }
+
+    #[test]
+    fn madvise_display() {
+        let e = TurbineError::Madvise(std::io::Error::new(std::io::ErrorKind::Other, "fail"));
+        let msg = format!("{e}");
+        assert!(msg.contains("madvise"));
         assert!(msg.contains("fail"));
     }
 
