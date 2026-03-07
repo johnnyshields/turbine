@@ -9,22 +9,62 @@ epoch's arena uses append-only bump allocation -- no contention, no locking.
 
 **Status:** Early (v0.1.0) | **Platform:** Linux only | **License:** MIT
 
+## Motivation
+
+Turbine started as exploration into combining two models that don't normally
+coexist: **BEAM/OTP-style microprocesses** and **io_uring thread-per-core I/O**.
+
+The BEAM VM (Erlang/Elixir) excels at lightweight concurrency -- millions of
+isolated processes communicating via message passing, with preemptive scheduling
+and fault supervision. But its I/O model is mediated through ports and drivers
+(essentially epoll-based), and it has no story for io_uring's fixed-buffer
+registration, scatter/gather, or zero-copy submission.
+
+Thread-per-core runtimes like [Monoio](https://github.com/bytedance/monoio)
+and [Glommio](https://github.com/DataDog/glommio) go the other direction: they
+pin work to cores, eliminate cross-thread synchronization entirely, and build
+directly on io_uring. The tradeoff is that buffers are strictly thread-local --
+no sharing, no migration. This is ideal for uniform network proxies but
+fundamentally incompatible with the BEAM model, where any process can message
+any other process regardless of which scheduler thread it runs on.
+
+A BEAM-like runtime on io_uring needs **efficient cross-thread buffer sharing**.
+Processes on thread A produce I/O buffers that processes on thread B consume.
+Neither the thread-per-core "no sharing" model nor Tokio's "Arc\<Mutex\<>>"
+approach is satisfactory:
+
+- Thread-per-core runtimes (Monoio, Glommio) simply forbid cross-thread
+  buffers. Their `!Send` buffer types have no transfer path at all.
+- Tokio's work-stealing model makes buffers routinely cross threads, but at the
+  cost of heap allocation and atomic reference counting per buffer.
+- Neither approach provides io_uring fixed-buffer registration, which requires
+  stable, pre-registered memory regions.
+
+Turbine solves this with **epoch-based buffer arenas** that are thread-local for
+allocation (zero-contention bump alloc via `Cell`) but support explicit
+cross-thread transfer via a **split-counter atomic lease** -- local operations
+stay non-atomic, while cross-thread release is a single `fetch_add`. No
+channels, no `Arc`, no mutex. The arena's memory is stable (mmap'd, `Box`-pinned
+in a slab), so pointers remain valid across threads for the lifetime of the
+lease.
+
 ## Why Turbine?
 
-Most Rust io_uring runtimes (Compio, Monoio, Glommio) solve scheduling and I/O
-submission but leave buffer allocation to the application. Per-operation heap
-allocation and partial fixed-buffer support leave performance on the table at
-extreme throughput.
+Most Rust io_uring runtimes solve scheduling and I/O submission but leave buffer
+allocation to the application. Per-operation heap allocation and partial
+fixed-buffer support leave performance on the table at extreme throughput.
 
 | | Turbine | Typical runtime |
 |---|---|---|
 | **Alloc cost** | 1 branch + 1 store (bump) | Heap box per I/O op |
 | **Contention** | Zero (thread-local `Cell`) | Allocator-dependent |
 | **Fixed-buffer reg** | Full `IORING_REGISTER_BUFFERS` | Partial or none |
+| **Cross-thread** | 1 atomic op (split counter) | Channel or Arc+Mutex |
 | **Reclamation** | Epoch-scoped bulk collect | Per-buffer dealloc |
 
-Turbine is designed to slot underneath a runtime (Compio's decoupled driver, a
-custom event loop, etc.) as the buffer management layer -- not to replace it.
+Turbine is not a runtime. It is designed to slot underneath one (Compio's
+decoupled driver, a custom event loop, a BEAM-like scheduler) as the buffer
+management layer.
 
 ## Crates
 
@@ -163,13 +203,13 @@ Use `NoopHooks` for standalone operation.
   weakness -- a single long-lived buffer blocks collection of its whole arena.
 - **Registration is static.** `register_buffers()` is called once. Dynamic
   resizing requires unregister + re-register, which stalls the ring.
-- **No benchmarks yet.** Needs comparison against slab+Mutex, crossbeam-epoch,
-  and provided buffer rings under realistic I/O patterns.
 
 ## Target Workloads
 
 **Best fit:** High-throughput, steady-state I/O servers (proxies, message
 brokers, storage engines) where I/O patterns have strong temporal locality.
+Also well-suited as the buffer layer for custom runtimes exploring BEAM-like
+concurrency models on top of io_uring.
 
 **Risky fit:** Bursty or highly variable workloads where static arena sizing
 and epoch-scoped lifetimes may waste memory or pin arenas too long.
@@ -179,3 +219,17 @@ and epoch-scoped lifetimes may waste memory or pin arenas too long.
 Turbine slots underneath Compio (using its decoupled driver) or a custom event
 loop, replacing per-operation buffer allocation with epoch-rotated arenas.
 Compio's driver-executor separation makes this feasible without forking.
+
+## Benchmarks
+
+See [docs/benchmarks.md](docs/benchmarks.md) for detailed numbers. Headlines:
+
+| Path | Latency |
+|------|---------|
+| Lease (any size) | ~19 ns (constant -- bump alloc) |
+| Cross-thread transfer | ~300--400 ns (1 atomic op) |
+| Full epoch lifecycle | ~380--490 ns (rotate + collect) |
+
+Cross-thread transfer beats Vec baseline at every buffer size and dominates at
+64 KiB (392 ns vs 1.4 us) because Turbine transfers a lightweight handle
+(pointer + metadata) rather than moving heap data.

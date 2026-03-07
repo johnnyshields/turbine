@@ -83,17 +83,22 @@ A `PinnedWrite<'a>` borrows `&mut LeasedBuffer`, preventing the buffer from
 being dropped while an io_uring submission is in flight. Exposes raw pointers
 and the buf_index for SQE construction.
 
-### Cross-Thread Transfer
+### Cross-Thread Transfer (Split-Counter Atomic Lease)
 
 For buffers that need to cross thread boundaries (e.g. a worker thread
 processing data from an I/O thread):
 
-1. Call `into_sendable(handle)` on a `LeasedBuffer` → `SendableBuffer`.
+1. Call `into_sendable()` on a `LeasedBuffer` → `SendableBuffer`.
 2. `SendableBuffer` is `Send` (unsafe impl; safety relies on lease_count
-   invariant).
-3. When the `SendableBuffer` is dropped on the remote thread, it sends a
-   `ReturnedBuffer { epoch, arena_idx }` through a crossbeam channel.
-4. The owning thread calls `pool.drain_returns()` to decrement lease counts.
+   invariant and `Box<Arena>` pointer stability).
+3. When the `SendableBuffer` is dropped on the remote thread, it atomically
+   increments the arena's `remote_returns` counter via `fetch_add(1, Release)`.
+4. The owning thread calls `pool.collect()` — arenas with
+   `lease_count - remote_returns == 0` are eligible for recycling.
+
+This split-counter design keeps local operations non-atomic (`Cell<usize>`)
+while cross-thread release is a single atomic op. No channel, no `Arc`, no
+allocation on the return path.
 
 ### io_uring Registration
 
@@ -105,10 +110,10 @@ buf_index for `IORING_OP_READ_FIXED` / `WRITE_FIXED`.
 
 Two trait hooks for optional integration:
 
-- **`BufferPinHook`**: `on_pin` / `on_release` — track individual buffer
+- **`BufferPinHook`**: `on_pin` — called when a buffer is leased from an arena.
+- **`EpochObserver`**: `on_rotate` / `on_collect` / `on_arena_alloc` /
+  `on_arena_free` / `on_collect_sweep` — react to epoch transitions and arena
   lifecycle events.
-- **`EpochObserver`**: `on_rotate` / `on_collect` — react to epoch
-  transitions.
 
 `NoopHooks` provides zero-cost no-op implementations for standalone use.
 

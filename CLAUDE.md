@@ -22,7 +22,7 @@ lore/             # Implementation notes and research documents
 - `transfer/handle.rs` — `SendableBuffer`: cross-thread buffer transfer via atomic lease release
 - `ring/registration.rs` — `RingRegistration`: slot allocator + arena-to-slot mapping for io_uring
 - `config.rs` — `PoolConfig`: arena size, initial count, max free/total arenas, registration slots, page size
-- `gc.rs` — `BufferPinHook` + `EpochObserver` traits (with arena alloc/free/sweep hooks), `NoopHooks`
+- `gc.rs` — `BufferPinHook` (`on_pin`) + `EpochObserver` traits (with arena alloc/free/sweep hooks), `NoopHooks`
 - `error.rs` — `TurbineError` enum, `Result<T>` alias
 
 ## Build & Test

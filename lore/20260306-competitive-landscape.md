@@ -20,7 +20,7 @@ management layer.
 | **io_uring integration** | Full fixed-buffer registration | Proactor (3 backends) | Primary backend | 3-ring architecture | None (uses epoll) |
 | **Fixed-buffer support** | Yes (1:1 arena→iovec) | Partial (provided rings) | Not prominent | Not prominent | No |
 | **Cross-platform** | Linux only | Linux + Windows + fallback | Linux + mio fallback | Linux only | Cross-platform (WASM) |
-| **Cross-thread** | Explicit transfer + channel | N/A (per-core) | Shared waker channels | SPSC lockless channels | Serialized messages |
+| **Cross-thread** | Explicit transfer + 1 atomic | N/A (per-core) | Shared waker channels | SPSC lockless channels | Serialized messages |
 | **Contention on alloc** | Zero | Allocator-dependent | Per-buffer ownership | Allocator-dependent | N/A |
 | **Status** | Early (v0.1.0) | Active (v0.18.0, Iggy uses it) | Active (ByteDance) | Effectively dead | Slowing |
 
@@ -60,10 +60,14 @@ Uses an ownership-transfer ("rent") model for buffers — you hand the buffer
 to the runtime, get it back on completion. No work-stealing, so tasks don't
 need to be `Send`.
 
-**Differentiation:** Monoio solves scheduling and I/O submission. It has no
-purpose-built buffer allocator that eliminates contention on the allocation
-path while maintaining io_uring fixed-buffer registration. Buffer management
-is left to the application.
+**Differentiation:** Monoio deliberately avoids cross-thread buffer sharing —
+buffers are strictly thread-local with no transfer path. This is the right
+call for pure thread-per-core workloads (network proxies, uniform request
+handlers) but is incompatible with any model requiring cross-thread data flow,
+such as BEAM-style process migration or work-stealing schedulers. Turbine
+fills this gap: thread-local bump allocation for the hot path, with explicit
+cross-thread transfer via a single atomic op when needed. Monoio also has no
+purpose-built buffer allocator for io_uring fixed-buffer registration.
 
 ### Glommio (Datadog)
 
