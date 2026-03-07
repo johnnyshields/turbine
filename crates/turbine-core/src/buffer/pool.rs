@@ -384,6 +384,38 @@ mod tests {
         assert!(removed > 0, "should have removed excess free arenas");
     }
 
+    #[test]
+    fn cross_thread_sendable_buffer_release() {
+        let pool = test_pool();
+
+        let buf = pool.lease(64).unwrap();
+        let epoch = buf.epoch();
+
+        // Write recognizable data.
+        let data_ptr = buf.as_slice().as_ptr();
+        unsafe { std::ptr::write_bytes(data_ptr as *mut u8, 0xCD, 64) };
+
+        let sendable = buf.into_sendable();
+
+        pool.rotate().unwrap();
+
+        // Can't collect — SendableBuffer still alive.
+        assert!(pool.collect_epoch(epoch).is_err());
+
+        // Send to another thread, read data, drop there.
+        let handle = std::thread::spawn(move || {
+            let slice = unsafe { sendable.as_slice() };
+            assert_eq!(slice.len(), 64);
+            assert!(slice.iter().all(|&b| b == 0xCD));
+            // sendable dropped here on the spawned thread
+        });
+
+        handle.join().expect("spawned thread panicked");
+
+        // Now collect_epoch succeeds — atomic remote_release crossed threads.
+        pool.collect_epoch(epoch).unwrap();
+    }
+
     /// Compile-time assertion that IouringBufferPool is !Send.
     #[test]
     fn pool_is_not_send() {

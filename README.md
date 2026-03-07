@@ -47,7 +47,7 @@ buf.as_mut_slice()[..5].copy_from_slice(b"hello");
 pool.rotate()?;
 
 // Once all leases from epoch 0 are returned, reclaim its memory.
-pool.try_collect(0)?;
+pool.collect_epoch(0)?;
 ```
 
 ## Cross-Thread Transfer
@@ -56,18 +56,17 @@ Buffers are `!Send` by design -- they hold raw pointers into thread-local
 arenas. To send data to another thread, convert a lease into a `SendableBuffer`:
 
 ```rust
-let handle = pool.transfer_handle();
-let sendable = buf.into_sendable(&handle);
+let sendable = buf.into_sendable();
 
 // `sendable` is Send -- ship it to another thread.
-// When dropped, it notifies the owning thread via channel.
+// When dropped, it atomically decrements the arena's lease count.
 std::thread::spawn(move || {
     let data = unsafe { sendable.as_slice() };
     // ... process data ...
-}); // drop sends ReturnedBuffer back
+}); // drop atomically releases the lease
 
-// On the pool's thread, drain returns to release leases.
-pool.drain_returns();
+// On the pool's thread, collect reclaims arenas with zero leases.
+pool.collect();
 ```
 
 ## Architecture
@@ -79,7 +78,7 @@ IouringBufferPool
  │    ├── Arena 1
  │    └── Arena N-1
  ├── RingRegistration (io_uring fixed-buffer iovecs)
- └── Channel (crossbeam, for cross-thread returns)
+ └── Split Counter (Cell + AtomicUsize per arena, for cross-thread returns)
 ```
 
 **Epoch lifecycle:** `Writable` -> `Retired` -> `Collected` -> (recycled as `Writable`)
@@ -113,22 +112,26 @@ prevent use-after-free and data corruption:
    forge a `SendableBuffer` -- it must go through `LeasedBuffer::into_sendable()`,
    which uses `ManuallyDrop` to transfer lease ownership without double-decrement.
 
-6. **`drain_returns` uses direct arena indexing with epoch sanity checks.**
-   O(1) lookup by arena index instead of linear epoch scan, with a secondary
-   epoch check to detect (impossible-after-fix-1) arena recycling races.
+6. **`SendableBuffer` stores `*const AtomicUsize` pointing to arena's `remote_returns`.**
+   Valid because `Box<Arena>` provides address stability and the arena cannot be
+   freed while outstanding leases exist (the split counter prevents it).
 
 ## Configuration
 
 ```rust
 PoolConfig {
     arena_size: 2 * 1024 * 1024,  // 2 MiB per arena
-    arena_count: 4,                 // 4 arenas in the ring
-    page_size: 4096,                // mmap page alignment
+    initial_arenas: 4,             // 4 arenas at startup
+    max_free_arenas: 4,            // max arenas kept in free pool
+    max_total_arenas: 0,           // 0 = unlimited
+    registration_slots: 32,        // io_uring fixed-buffer slots
+    page_size: 4096,               // mmap page alignment
 }
 ```
 
-- `arena_count` must be >= 2 (one writable, at least one draining)
+- `initial_arenas` must be >= 1 (one writable; draining arenas accumulate in drain queue)
 - `arena_size` must be a multiple of `page_size`
+- `registration_slots` must be >= `initial_arenas`
 - Default config: 4 arenas x 2 MiB = 8 MiB total
 
 ## Hooks
@@ -139,12 +142,14 @@ GC, or debugging infrastructure:
 ```rust
 pub trait BufferPinHook {
     fn on_pin(&self, epoch: u64, buf_id: u32);
-    fn on_release(&self, epoch: u64, buf_id: u32);
 }
 
 pub trait EpochObserver {
     fn on_rotate(&self, retired: u64, active: u64);
     fn on_collect(&self, epoch: u64);
+    fn on_arena_alloc(&self, arena_idx: ArenaIdx) {}
+    fn on_arena_free(&self, arena_idx: ArenaIdx) {}
+    fn on_collect_sweep(&self, collected: usize) {}
 }
 ```
 

@@ -339,6 +339,29 @@ mod tests {
     }
 
     #[test]
+    fn mixed_local_and_remote_release() {
+        let arena = Arena::new(4096).unwrap();
+        arena.set_state(ArenaState::Writable);
+
+        // Acquire 3 leases.
+        arena.acquire_lease();
+        arena.acquire_lease();
+        arena.acquire_lease();
+        assert_eq!(arena.lease_count(), 3);
+
+        // Release 1 locally.
+        arena.release_lease();
+        assert_eq!(arena.lease_count(), 2);
+
+        // Release 2 remotely.
+        arena.remote_release();
+        assert_eq!(arena.lease_count(), 1);
+
+        arena.remote_release();
+        assert_eq!(arena.lease_count(), 0);
+    }
+
+    #[test]
     fn allocations_are_contiguous() {
         let arena = Arena::new(4096).unwrap();
         arena.set_state(ArenaState::Writable);
