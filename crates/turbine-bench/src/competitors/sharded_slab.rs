@@ -28,6 +28,12 @@ impl ShardedSlabPool {
     }
 }
 
+impl Default for ShardedSlabPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct ShardedSlabHandle {
     inner: Arc<Slab<Vec<u8>>>,
 }

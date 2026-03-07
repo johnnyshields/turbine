@@ -11,10 +11,8 @@ impl BumpaloPool {
     }
 
     /// Allocate a zeroed slice from the bump allocator.
-    /// Returns a raw pointer to avoid lifetime issues in benchmarks.
-    pub fn lease(&self, len: usize) -> *mut u8 {
-        let slice = self.bump.alloc_slice_fill_default(len);
-        slice.as_mut_ptr()
+    pub fn lease(&self, len: usize) -> &mut [u8] {
+        self.bump.alloc_slice_fill_default(len)
     }
 
     /// Reset the bump allocator, reclaiming all memory.

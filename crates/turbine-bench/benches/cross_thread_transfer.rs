@@ -6,25 +6,20 @@ use std::thread;
 use turbine_bench::competitors::{
     slab_mutex::SlabPool, sharded_slab::ShardedSlabPool, vec_baseline::VecBaseline,
 };
+use turbine_bench::{SIZES, arena_size_for};
 use turbine_core::buffer::pool::IouringBufferPool;
 use turbine_core::config::PoolConfig;
 use turbine_core::gc::NoopHooks;
 
-const SIZES: &[usize] = &[64, 512, 4096, 65536];
 const BATCH_SIZE: usize = 32;
 
-fn arena_size_for(buf_size: usize) -> usize {
-    let min = buf_size * 64;
-    let aligned = (min + 4095) & !4095;
-    aligned.max(4096)
+/// Generic work item for cross-thread benchmarks.
+enum WorkItem<T> {
+    Transfer(T),
+    Shutdown,
 }
 
 // --- Turbine cross-thread ---
-
-enum TurbineWork {
-    Transfer(turbine_core::transfer::handle::SendableBuffer),
-    Shutdown,
-}
 
 fn bench_cross_thread_turbine(c: &mut Criterion) {
     let mut group = c.benchmark_group("cross_thread/turbine");
@@ -42,16 +37,19 @@ fn bench_cross_thread_turbine(c: &mut Criterion) {
             let pool = IouringBufferPool::new(config.clone(), NoopHooks).unwrap();
             let handle = pool.transfer_handle();
 
-            let (tx, rx): (Sender<TurbineWork>, Receiver<TurbineWork>) = bounded(64);
+            let (tx, rx): (
+                Sender<WorkItem<turbine_core::transfer::handle::SendableBuffer>>,
+                Receiver<WorkItem<turbine_core::transfer::handle::SendableBuffer>>,
+            ) = bounded(64);
 
             let worker = thread::spawn(move || {
                 while let Ok(work) = rx.recv() {
                     match work {
-                        TurbineWork::Transfer(sendable) => {
+                        WorkItem::Transfer(sendable) => {
                             black_box(&sendable);
                             drop(sendable); // sends ReturnedBuffer through channel
                         }
-                        TurbineWork::Shutdown => break,
+                        WorkItem::Shutdown => break,
                     }
                 }
             });
@@ -70,14 +68,14 @@ fn bench_cross_thread_turbine(c: &mut Criterion) {
                     }
                 };
                 let sendable = buf.into_sendable(&handle);
-                tx.send(TurbineWork::Transfer(sendable)).unwrap();
+                tx.send(WorkItem::Transfer(sendable)).unwrap();
 
                 // Periodically drain returns.
                 pool.drain_returns();
             });
 
             // Shutdown worker.
-            tx.send(TurbineWork::Shutdown).unwrap();
+            tx.send(WorkItem::Shutdown).unwrap();
             worker.join().unwrap();
 
             // Final drain.
@@ -152,11 +150,6 @@ fn bench_cross_thread_turbine_batch(c: &mut Criterion) {
 
 // --- Slab+Mutex cross-thread ---
 
-enum SlabWork {
-    Release(usize),
-    Shutdown,
-}
-
 fn bench_cross_thread_slab_mutex(c: &mut Criterion) {
     let mut group = c.benchmark_group("cross_thread/slab_mutex");
 
@@ -166,15 +159,15 @@ fn bench_cross_thread_slab_mutex(c: &mut Criterion) {
             let pool = SlabPool::new();
             let handle = pool.handle();
 
-            let (tx, rx): (Sender<SlabWork>, Receiver<SlabWork>) = bounded(64);
+            let (tx, rx): (Sender<WorkItem<usize>>, Receiver<WorkItem<usize>>) = bounded(64);
 
             let worker = thread::spawn(move || {
                 while let Ok(work) = rx.recv() {
                     match work {
-                        SlabWork::Release(key) => {
+                        WorkItem::Transfer(key) => {
                             handle.release(key);
                         }
-                        SlabWork::Shutdown => break,
+                        WorkItem::Shutdown => break,
                     }
                 }
             });
@@ -182,10 +175,10 @@ fn bench_cross_thread_slab_mutex(c: &mut Criterion) {
             b.iter(|| {
                 let key = pool.lease(sz);
                 black_box(key);
-                tx.send(SlabWork::Release(key)).unwrap();
+                tx.send(WorkItem::Transfer(key)).unwrap();
             });
 
-            tx.send(SlabWork::Shutdown).unwrap();
+            tx.send(WorkItem::Shutdown).unwrap();
             worker.join().unwrap();
         });
     }
@@ -193,11 +186,6 @@ fn bench_cross_thread_slab_mutex(c: &mut Criterion) {
 }
 
 // --- Sharded slab cross-thread ---
-
-enum ShardedSlabWork {
-    Release(usize),
-    Shutdown,
-}
 
 fn bench_cross_thread_sharded_slab(c: &mut Criterion) {
     let mut group = c.benchmark_group("cross_thread/sharded_slab");
@@ -208,15 +196,15 @@ fn bench_cross_thread_sharded_slab(c: &mut Criterion) {
             let pool = ShardedSlabPool::new();
             let handle = pool.handle();
 
-            let (tx, rx): (Sender<ShardedSlabWork>, Receiver<ShardedSlabWork>) = bounded(64);
+            let (tx, rx): (Sender<WorkItem<usize>>, Receiver<WorkItem<usize>>) = bounded(64);
 
             let worker = thread::spawn(move || {
                 while let Ok(work) = rx.recv() {
                     match work {
-                        ShardedSlabWork::Release(key) => {
+                        WorkItem::Transfer(key) => {
                             handle.release(key);
                         }
-                        ShardedSlabWork::Shutdown => break,
+                        WorkItem::Shutdown => break,
                     }
                 }
             });
@@ -224,10 +212,10 @@ fn bench_cross_thread_sharded_slab(c: &mut Criterion) {
             b.iter(|| {
                 let key = pool.lease(sz);
                 black_box(key);
-                tx.send(ShardedSlabWork::Release(key)).unwrap();
+                tx.send(WorkItem::Transfer(key)).unwrap();
             });
 
-            tx.send(ShardedSlabWork::Shutdown).unwrap();
+            tx.send(WorkItem::Shutdown).unwrap();
             worker.join().unwrap();
         });
     }
@@ -236,27 +224,22 @@ fn bench_cross_thread_sharded_slab(c: &mut Criterion) {
 
 // --- Vec baseline cross-thread ---
 
-enum VecWork {
-    Transfer(Vec<u8>),
-    Shutdown,
-}
-
 fn bench_cross_thread_vec_baseline(c: &mut Criterion) {
     let mut group = c.benchmark_group("cross_thread/vec_baseline");
 
     for &size in SIZES {
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &sz| {
-            let (tx, rx): (Sender<VecWork>, Receiver<VecWork>) = bounded(64);
+            let (tx, rx) = bounded::<WorkItem<Vec<u8>>>(64);
 
             let worker = thread::spawn(move || {
                 while let Ok(work) = rx.recv() {
                     match work {
-                        VecWork::Transfer(buf) => {
+                        WorkItem::Transfer(buf) => {
                             black_box(&buf);
                             VecBaseline::release(buf);
                         }
-                        VecWork::Shutdown => break,
+                        WorkItem::Shutdown => break,
                     }
                 }
             });
@@ -264,10 +247,10 @@ fn bench_cross_thread_vec_baseline(c: &mut Criterion) {
             b.iter(|| {
                 let buf = VecBaseline::lease(sz);
                 black_box(&buf);
-                tx.send(VecWork::Transfer(buf)).unwrap();
+                tx.send(WorkItem::Transfer(buf)).unwrap();
             });
 
-            tx.send(VecWork::Shutdown).unwrap();
+            tx.send(WorkItem::Shutdown).unwrap();
             worker.join().unwrap();
         });
     }

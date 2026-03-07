@@ -30,6 +30,12 @@ impl SlabPool {
     }
 }
 
+impl Default for SlabPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct SlabHandle {
     inner: Arc<Mutex<Slab<Vec<u8>>>>,
 }

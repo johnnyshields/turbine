@@ -5,19 +5,10 @@ use turbine_bench::competitors::{
     bumpalo_pool::BumpaloPool, bytes_pool::BytesPool, crossbeam_pool::CrossbeamPool,
     slab_mutex::SlabPool, sharded_slab::ShardedSlabPool, vec_baseline::VecBaseline,
 };
+use turbine_bench::{SIZES, arena_size_for};
 use turbine_core::buffer::pool::IouringBufferPool;
 use turbine_core::config::PoolConfig;
 use turbine_core::gc::NoopHooks;
-
-const SIZES: &[usize] = &[64, 512, 4096, 65536];
-
-/// Compute arena size for a given buffer size.
-/// Ensures at least 64 buffers fit, rounded up to page alignment.
-fn arena_size_for(buf_size: usize) -> usize {
-    let min = buf_size * 64;
-    let aligned = (min + 4095) & !4095; // next multiple of 4096
-    aligned.max(4096)
-}
 
 fn bench_turbine(c: &mut Criterion) {
     let mut group = c.benchmark_group("lease_throughput/turbine");
@@ -33,7 +24,6 @@ fn bench_turbine(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &sz| {
             let pool = IouringBufferPool::new(config.clone(), NoopHooks).unwrap();
-            let bufs_per_arena = arena_size / sz.max(1);
 
             b.iter(|| {
                 let buf = match pool.lease(sz) {
@@ -51,8 +41,6 @@ fn bench_turbine(c: &mut Criterion) {
                 black_box(&buf);
                 drop(buf);
             });
-
-            let _ = bufs_per_arena; // suppress unused warning
         });
     }
     group.finish();
@@ -121,8 +109,8 @@ fn bench_bumpalo(c: &mut Criterion) {
             let mut pool = BumpaloPool::new(capacity);
             let mut count = 0usize;
             b.iter(|| {
-                let ptr = pool.lease(sz);
-                black_box(ptr);
+                let slice = pool.lease(sz);
+                black_box(slice);
                 count += 1;
                 if count >= bufs_per_arena {
                     pool.reset();

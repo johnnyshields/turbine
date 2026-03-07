@@ -1,23 +1,20 @@
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 
+use turbine_bench::arena_size_for;
 use turbine_core::buffer::pool::IouringBufferPool;
 use turbine_core::config::PoolConfig;
 use turbine_core::gc::NoopHooks;
 
-const SIZES: &[usize] = &[64, 512, 4096];
-
-fn arena_size_for(buf_size: usize) -> usize {
-    let min = buf_size * 64;
-    let aligned = (min + 4095) & !4095;
-    aligned.max(4096)
-}
+/// Sizes for epoch rotation — excludes 65536 since epoch lifecycle is more
+/// about rotation overhead than large-buffer throughput.
+const EPOCH_SIZES: &[usize] = &[64, 512, 4096];
 
 /// Full epoch lifecycle: lease a batch → rotate → drop all → collect.
 fn bench_epoch_lifecycle(c: &mut Criterion) {
     let mut group = c.benchmark_group("epoch_lifecycle");
 
-    for &size in SIZES {
+    for &size in EPOCH_SIZES {
         let arena_size = arena_size_for(size);
         let config = PoolConfig {
             arena_size,
@@ -26,6 +23,7 @@ fn bench_epoch_lifecycle(c: &mut Criterion) {
         };
         let bufs_per_batch = (arena_size / size.max(1)).min(64);
 
+        group.throughput(Throughput::Elements(bufs_per_batch as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &sz| {
             let pool = IouringBufferPool::new(config.clone(), NoopHooks).unwrap();
 
