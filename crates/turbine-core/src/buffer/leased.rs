@@ -3,6 +3,7 @@ use std::rc::Rc;
 
 use crate::buffer::pinned::PinnedWrite;
 use crate::epoch::arena::Arena;
+use crate::transfer::handle::{SendableBuffer, TransferHandle};
 
 /// A leased buffer from an epoch arena. Not `Send` — must stay on the
 /// owning thread.
@@ -17,6 +18,7 @@ pub struct LeasedBuffer {
     buf_id: u32,
     /// Raw pointer back to the arena for lease release on Drop.
     arena: *const Arena,
+    arena_idx: usize,
     /// Prevent Send/Sync.
     _not_send: PhantomData<Rc<()>>,
 }
@@ -34,6 +36,7 @@ impl LeasedBuffer {
         epoch: u64,
         buf_id: u32,
         arena: *const Arena,
+        arena_idx: usize,
     ) -> Self {
         Self {
             ptr,
@@ -41,6 +44,7 @@ impl LeasedBuffer {
             epoch,
             buf_id,
             arena,
+            arena_idx,
             _not_send: PhantomData,
         }
     }
@@ -70,6 +74,11 @@ impl LeasedBuffer {
         self.buf_id
     }
 
+    /// The index of the arena in the epoch clock ring.
+    pub fn arena_idx(&self) -> usize {
+        self.arena_idx
+    }
+
     /// Length of the buffer in bytes.
     pub fn len(&self) -> usize {
         self.len
@@ -78,6 +87,23 @@ impl LeasedBuffer {
     /// Returns `true` if the buffer has zero length.
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Convert this leased buffer into a [`SendableBuffer`] that can cross thread boundaries.
+    ///
+    /// Consumes `self` **without** calling `Drop`, so the arena lease stays alive.
+    /// The lease is transferred to the `SendableBuffer`; when it drops, a
+    /// `ReturnedBuffer` message is sent through the channel for `drain_returns()`.
+    pub fn into_sendable(self, handle: &TransferHandle) -> SendableBuffer {
+        let me = std::mem::ManuallyDrop::new(self);
+        SendableBuffer::new(
+            me.ptr,
+            me.len,
+            me.epoch,
+            me.arena_idx,
+            me.buf_id,
+            handle.sender().clone(),
+        )
     }
 
     /// Pin this buffer for an io_uring write submission.
@@ -118,7 +144,7 @@ mod tests {
             std::ptr::write_bytes(ptr, 0xAB, 64);
         }
 
-        let buf = unsafe { LeasedBuffer::new(ptr, 64, 1, buf_id, &arena as *const Arena) };
+        let buf = unsafe { LeasedBuffer::new(ptr, 64, 1, buf_id, &arena as *const Arena, 0) };
 
         assert_eq!(buf.len(), 64);
         assert!(!buf.is_empty());
@@ -141,7 +167,7 @@ mod tests {
         let (ptr, buf_id) = arena.alloc(16).unwrap();
         arena.acquire_lease();
 
-        let mut buf = unsafe { LeasedBuffer::new(ptr, 16, 1, buf_id, &arena as *const Arena) };
+        let mut buf = unsafe { LeasedBuffer::new(ptr, 16, 1, buf_id, &arena as *const Arena, 0) };
         buf.as_mut_slice().copy_from_slice(&[1u8; 16]);
         assert!(buf.as_slice().iter().all(|&b| b == 1));
     }
@@ -158,7 +184,7 @@ mod tests {
 
         {
             let _buf =
-                unsafe { LeasedBuffer::new(ptr, 32, 1, buf_id, &arena as *const Arena) };
+                unsafe { LeasedBuffer::new(ptr, 32, 1, buf_id, &arena as *const Arena, 0) };
             assert_eq!(arena.lease_count(), 1);
         }
         // After drop, lease count should be decremented.
@@ -175,7 +201,7 @@ mod tests {
         let (ptr, buf_id) = arena.alloc(0).unwrap();
         arena.acquire_lease();
 
-        let buf = unsafe { LeasedBuffer::new(ptr, 0, 1, buf_id, &arena as *const Arena) };
+        let buf = unsafe { LeasedBuffer::new(ptr, 0, 1, buf_id, &arena as *const Arena, 0) };
         assert!(buf.is_empty());
         assert_eq!(buf.len(), 0);
         assert_eq!(buf.as_slice(), &[]);
@@ -190,7 +216,7 @@ mod tests {
         let (ptr, buf_id) = arena.alloc(64).unwrap();
         arena.acquire_lease();
 
-        let mut buf = unsafe { LeasedBuffer::new(ptr, 64, 1, buf_id, &arena as *const Arena) };
+        let mut buf = unsafe { LeasedBuffer::new(ptr, 64, 1, buf_id, &arena as *const Arena, 0) };
         {
             let pinned = buf.pin_for_write();
             assert_eq!(pinned.len(), 64);
@@ -198,5 +224,39 @@ mod tests {
         }
         // Buffer is usable again after PinnedWrite is dropped.
         assert_eq!(buf.len(), 64);
+    }
+
+    #[test]
+    fn into_sendable_keeps_lease_alive() {
+        use crossbeam_channel::unbounded;
+        use crate::transfer::handle::TransferHandle;
+
+        let arena = Arena::new(4096).unwrap();
+        arena.set_state(ArenaState::Writable);
+        arena.set_epoch(1);
+
+        let (ptr, buf_id) = arena.alloc(64).unwrap();
+        arena.acquire_lease();
+
+        let buf = unsafe { LeasedBuffer::new(ptr, 64, 1, buf_id, &arena as *const Arena, 0) };
+
+        let (tx, rx) = unbounded();
+        let handle = TransferHandle::new(tx);
+
+        // into_sendable consumes the LeasedBuffer without decrementing lease_count.
+        let sendable = buf.into_sendable(&handle);
+        assert_eq!(arena.lease_count(), 1, "lease must stay alive after into_sendable");
+
+        // Drop the SendableBuffer — sends ReturnedBuffer through channel.
+        drop(sendable);
+
+        let returned = rx.try_recv().expect("should receive ReturnedBuffer on drop");
+        assert_eq!(returned.epoch, 1);
+        assert_eq!(returned.arena_idx, 0);
+        assert_eq!(returned.buf_id, buf_id);
+
+        // Manually release the lease (normally drain_returns would do this).
+        arena.release_lease();
+        assert_eq!(arena.lease_count(), 0);
     }
 }

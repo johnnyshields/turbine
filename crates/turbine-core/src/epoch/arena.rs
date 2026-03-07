@@ -84,8 +84,7 @@ impl Arena {
         self.offset.set(new_offset);
 
         let buf_id = self.next_buf_id.get();
-        let next = buf_id.checked_add(1)?;
-        self.next_buf_id.set(next);
+        self.next_buf_id.set(buf_id.wrapping_add(1));
 
         let ptr = unsafe { self.base.as_ptr().add(current) };
         Some((ptr, buf_id))
@@ -168,6 +167,7 @@ impl Drop for Arena {
     fn drop(&mut self) {
         let count = self.lease_count.get();
         if count > 0 {
+            debug_assert_eq!(count, 0, "arena dropped with {} outstanding leases", count);
             tracing::warn!(
                 epoch = self.epoch.get(),
                 leases = count,

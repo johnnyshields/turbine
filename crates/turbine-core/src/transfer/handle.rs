@@ -44,7 +44,7 @@ pub struct SendableBuffer {
 unsafe impl Send for SendableBuffer {}
 
 impl SendableBuffer {
-    pub fn new(
+    pub(crate) fn new(
         ptr: *const u8,
         len: usize,
         epoch: u64,

@@ -1,3 +1,6 @@
+use std::marker::PhantomData;
+use std::rc::Rc;
+
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
 use crate::buffer::leased::LeasedBuffer;
@@ -18,6 +21,7 @@ pub struct IouringBufferPool<H> {
     sender: Sender<ReturnedBuffer>,
     receiver: Receiver<ReturnedBuffer>,
     hooks: H,
+    _not_send: PhantomData<Rc<()>>,
 }
 
 impl<H: BufferPinHook + EpochObserver> IouringBufferPool<H> {
@@ -32,6 +36,7 @@ impl<H: BufferPinHook + EpochObserver> IouringBufferPool<H> {
             sender,
             receiver,
             hooks,
+            _not_send: PhantomData,
         })
     }
 
@@ -49,14 +54,16 @@ impl<H: BufferPinHook + EpochObserver> IouringBufferPool<H> {
         // SAFETY: ptr points into the arena's mmap region which is valid
         // for the arena's lifetime. The arena outlives the lease because
         // lease_count > 0 prevents collection.
-        let buf = unsafe { LeasedBuffer::new(ptr, len, arena.epoch(), buf_id, arena) };
+        let arena_idx = self.clock.current_arena_idx();
+        let buf = unsafe { LeasedBuffer::new(ptr, len, arena.epoch(), buf_id, arena, arena_idx) };
         Some(buf)
     }
 
     /// Rotate to a new epoch: retire the current arena and activate the next.
-    pub fn rotate(&self) {
-        let (retired, active) = self.clock.rotate();
+    pub fn rotate(&self) -> Result<()> {
+        let (retired, active) = self.clock.rotate()?;
         self.hooks.on_rotate(retired, active);
+        Ok(())
     }
 
     /// Try to collect (reclaim) the arena that served `epoch`.
@@ -85,14 +92,24 @@ impl<H: BufferPinHook + EpochObserver> IouringBufferPool<H> {
     pub fn drain_returns(&self) -> usize {
         let mut count = 0usize;
         while let Ok(ret) = self.receiver.try_recv() {
-            if let Ok(arena) = self.clock.arena_for_epoch(ret.epoch) {
+            if let Some(arena) = self.clock.arena_at(ret.arena_idx) {
+                if arena.epoch() != ret.epoch {
+                    tracing::error!(
+                        expected_epoch = ret.epoch,
+                        actual_epoch = arena.epoch(),
+                        arena_idx = ret.arena_idx,
+                        "arena epoch mismatch in drain_returns"
+                    );
+                    continue;
+                }
                 arena.release_lease();
                 self.hooks.on_release(ret.epoch, ret.buf_id);
                 count += 1;
             } else {
-                tracing::warn!(
+                tracing::error!(
+                    arena_idx = ret.arena_idx,
                     epoch = ret.epoch,
-                    "received return for unknown epoch"
+                    "received return for unknown arena index"
                 );
             }
         }
@@ -163,10 +180,10 @@ mod tests {
         let pool = test_pool();
         assert_eq!(pool.epoch(), 0);
 
-        pool.rotate();
+        pool.rotate().unwrap();
         assert_eq!(pool.epoch(), 1);
 
-        pool.rotate();
+        pool.rotate().unwrap();
         assert_eq!(pool.epoch(), 2);
     }
 
@@ -179,7 +196,7 @@ mod tests {
         assert_eq!(buf.epoch(), 0);
 
         // Rotate to epoch 1.
-        pool.rotate();
+        pool.rotate().unwrap();
 
         // Can't collect epoch 0 — still has a lease.
         assert!(pool.try_collect(0).is_err());
@@ -195,33 +212,20 @@ mod tests {
     fn drain_returns_decrements_lease() {
         let pool = test_pool();
 
-        // Lease and get transfer handle.
         let buf = pool.lease(64).unwrap();
         let handle = pool.transfer_handle();
 
-        // Simulate cross-thread transfer.
-        let sendable = crate::transfer::handle::SendableBuffer::new(
-            buf.as_slice().as_ptr(),
-            buf.len(),
-            buf.epoch(),
-            0, // arena_idx
-            0, // buf_id
-            handle.sender().clone(),
-        );
+        // Convert to sendable — lease stays alive, LeasedBuffer is consumed.
+        let sendable = buf.into_sendable(&handle);
 
-        // Drop the original lease (decrements once).
-        drop(buf);
-
-        // The arena lease_count is now 0 from the LeasedBuffer drop.
-        // Acquire a new lease to simulate the sendable buffer's hold.
-        pool.clock().current_arena().acquire_lease();
-        pool.rotate();
+        pool.rotate().unwrap();
 
         // Drop sendable — sends ReturnedBuffer through channel.
         drop(sendable);
 
         // Drain returns.
-        pool.drain_returns();
+        let drained = pool.drain_returns();
+        assert_eq!(drained, 1);
     }
 
     #[test]
@@ -248,12 +252,12 @@ mod tests {
         let _buf0 = pool.lease(64).unwrap();
         drop(_buf0);
 
-        pool.rotate(); // epoch 1, arena idx 1
+        pool.rotate().unwrap(); // epoch 1, arena idx 1
         assert_eq!(pool.epoch(), 1);
 
         pool.try_collect(0).unwrap(); // collect epoch 0
 
-        pool.rotate(); // epoch 2, arena idx 0 (wraps)
+        pool.rotate().unwrap(); // epoch 2, arena idx 0 (wraps)
         assert_eq!(pool.epoch(), 2);
 
         // Arena 0 was recycled — should be writable and usable again.
@@ -267,33 +271,15 @@ mod tests {
     fn drain_returns_count_and_enables_collection() {
         let pool = test_pool();
 
-        // Lease a buffer and capture its metadata before dropping.
         let buf = pool.lease(64).unwrap();
         let epoch = buf.epoch();
-        let ptr = buf.as_slice().as_ptr();
-        let len = buf.len();
-        let buf_id = 0u32;
-
         let handle = pool.transfer_handle();
 
-        // Create a sendable buffer (simulating cross-thread transfer).
-        // This acquires a logical hold — we manually acquire a lease to represent it.
-        pool.clock().current_arena().acquire_lease();
-
-        let sendable = crate::transfer::handle::SendableBuffer::new(
-            ptr,
-            len,
-            epoch,
-            0, // arena_idx
-            buf_id,
-            handle.sender().clone(),
-        );
-
-        // Drop the original lease (decrements lease_count by 1).
-        drop(buf);
+        // Convert to sendable — lease stays alive.
+        let sendable = buf.into_sendable(&handle);
 
         // Rotate so epoch 0 is retired.
-        pool.rotate();
+        pool.rotate().unwrap();
 
         // Can't collect yet — sendable still holds a lease.
         assert!(pool.try_collect(epoch).is_err());
@@ -303,9 +289,22 @@ mod tests {
 
         // Drain returns — should process 1 return.
         let drained = pool.drain_returns();
-        assert!(drained > 0);
+        assert_eq!(drained, 1);
 
         // Now collection succeeds.
         pool.try_collect(epoch).unwrap();
+    }
+
+    /// Compile-time assertion that IouringBufferPool is !Send.
+    /// If this test compiles, the pool cannot be sent across threads.
+    #[test]
+    fn pool_is_not_send() {
+        fn _assert_not_send<T>() {
+            // If IouringBufferPool were Send, this function body could call
+            // a function requiring T: Send. We just need the signature to exist
+            // as a witness that the type is NOT Send. The real assertion is the
+            // PhantomData<Rc<()>> marker on the struct.
+        }
+        _assert_not_send::<IouringBufferPool<NoopHooks>>();
     }
 }

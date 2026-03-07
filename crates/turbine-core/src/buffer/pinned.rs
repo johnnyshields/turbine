@@ -54,7 +54,7 @@ mod tests {
         let (ptr, buf_id) = arena.alloc(128).unwrap();
         arena.acquire_lease();
 
-        let mut buf = unsafe { LeasedBuffer::new(ptr, 128, 1, buf_id, &arena as *const Arena) };
+        let mut buf = unsafe { LeasedBuffer::new(ptr, 128, 1, buf_id, &arena as *const Arena, 0) };
 
         let mut pinned = buf.pin_for_write();
         assert_eq!(pinned.len(), 128);
@@ -73,7 +73,7 @@ mod tests {
         let (ptr, buf_id) = arena.alloc(0).unwrap();
         arena.acquire_lease();
 
-        let mut buf = unsafe { LeasedBuffer::new(ptr, 0, 1, buf_id, &arena as *const Arena) };
+        let mut buf = unsafe { LeasedBuffer::new(ptr, 0, 1, buf_id, &arena as *const Arena, 0) };
 
         let pinned = buf.pin_for_write();
         assert!(pinned.is_empty());

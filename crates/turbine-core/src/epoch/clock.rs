@@ -48,6 +48,11 @@ impl EpochClock {
         &self.arenas[self.write_idx.get()]
     }
 
+    /// Index of the currently writable arena in the ring.
+    pub fn current_arena_idx(&self) -> usize {
+        self.write_idx.get()
+    }
+
     /// Number of arenas in the ring.
     pub fn arena_count(&self) -> usize {
         self.arenas.len()
@@ -57,10 +62,10 @@ impl EpochClock {
     ///
     /// - Retires the current arena (state → Retired).
     /// - Advances the write index to the next arena in the ring.
-    /// - If the next arena is not yet collected and still has leases, logs a
-    ///   warning but continues (the old data will be overwritten).
-    /// - Returns `(retired_epoch, new_epoch)`.
-    pub fn rotate(&self) -> (u64, u64) {
+    /// - Returns `Err` if the next arena still has outstanding leases (preventing
+    ///   data corruption from recycling in-use memory).
+    /// - Returns `Ok((retired_epoch, new_epoch))` on success.
+    pub fn rotate(&self) -> Result<(u64, u64)> {
         let retired_epoch = self.epoch.get();
         let new_epoch = retired_epoch + 1;
 
@@ -73,11 +78,10 @@ impl EpochClock {
 
         let next_arena = &self.arenas[next_idx];
         if next_arena.lease_count() > 0 {
-            tracing::warn!(
-                epoch = next_arena.epoch(),
-                leases = next_arena.lease_count(),
-                "recycling arena with outstanding leases"
-            );
+            return Err(TurbineError::EpochNotCollectable(
+                next_arena.epoch(),
+                next_arena.lease_count(),
+            ));
         }
 
         // Activate the next arena.
@@ -87,7 +91,7 @@ impl EpochClock {
         self.write_idx.set(next_idx);
         self.epoch.set(new_epoch);
 
-        (retired_epoch, new_epoch)
+        Ok((retired_epoch, new_epoch))
     }
 
     /// Try to collect (reclaim) the arena that served `epoch`.
@@ -116,6 +120,11 @@ impl EpochClock {
             .iter()
             .find(|a| a.epoch() == epoch)
             .ok_or(TurbineError::EpochNotFound(epoch))
+    }
+
+    /// Bounds-checked direct access to an arena by index.
+    pub fn arena_at(&self, idx: usize) -> Option<&Arena> {
+        self.arenas.get(idx)
     }
 
     /// Iterator over all arenas in the ring (for io_uring registration).
@@ -154,11 +163,11 @@ mod tests {
     fn rotate_advances_monotonically() {
         let clock = EpochClock::new(&test_config(3)).unwrap();
 
-        let (retired, active) = clock.rotate();
+        let (retired, active) = clock.rotate().unwrap();
         assert_eq!(retired, 0);
         assert_eq!(active, 1);
 
-        let (retired, active) = clock.rotate();
+        let (retired, active) = clock.rotate().unwrap();
         assert_eq!(retired, 1);
         assert_eq!(active, 2);
     }
@@ -167,8 +176,8 @@ mod tests {
     fn rotate_wraps_around_ring() {
         let clock = EpochClock::new(&test_config(2)).unwrap();
 
-        clock.rotate(); // epoch 0→1, idx 0→1
-        clock.rotate(); // epoch 1→2, idx 1→0 (wraps)
+        clock.rotate().unwrap(); // epoch 0→1, idx 0→1
+        clock.rotate().unwrap(); // epoch 1→2, idx 1→0 (wraps)
 
         assert_eq!(clock.epoch(), 2);
         // The arena at index 0 should now be writable with epoch 2.
@@ -177,9 +186,27 @@ mod tests {
     }
 
     #[test]
+    fn rotate_blocked_by_outstanding_leases() {
+        let clock = EpochClock::new(&test_config(2)).unwrap();
+
+        // Acquire a lease on epoch 0's arena (index 0).
+        clock.current_arena().acquire_lease();
+
+        // Rotate to epoch 1 (arena index 1) — succeeds.
+        clock.rotate().unwrap();
+
+        // Rotate again would recycle arena 0 which still has a lease — must fail.
+        let err = clock.rotate().unwrap_err();
+        assert!(matches!(err, TurbineError::EpochNotCollectable(0, 1)));
+
+        // Release the lease so the arena doesn't debug_assert on drop.
+        clock.arena_for_epoch(0).unwrap().release_lease();
+    }
+
+    #[test]
     fn try_collect_succeeds_with_no_leases() {
         let clock = EpochClock::new(&test_config(3)).unwrap();
-        clock.rotate(); // retire epoch 0
+        clock.rotate().unwrap(); // retire epoch 0
 
         clock.try_collect(0).unwrap();
         let arena = clock.arena_for_epoch(0).unwrap();
@@ -190,17 +217,20 @@ mod tests {
     fn try_collect_fails_with_outstanding_leases() {
         let clock = EpochClock::new(&test_config(3)).unwrap();
         clock.current_arena().acquire_lease();
-        clock.rotate(); // retire epoch 0, which has a lease
+        clock.rotate().unwrap(); // retire epoch 0, which has a lease
 
         let err = clock.try_collect(0).unwrap_err();
         assert!(matches!(err, TurbineError::EpochNotCollectable(0, 1)));
+
+        // Release the lease so the arena doesn't debug_assert on drop.
+        clock.arena_for_epoch(0).unwrap().release_lease();
     }
 
     #[test]
     fn retained_epochs_lists_retired_arenas() {
         let clock = EpochClock::new(&test_config(4)).unwrap();
-        clock.rotate(); // retire 0
-        clock.rotate(); // retire 1
+        clock.rotate().unwrap(); // retire 0
+        clock.rotate().unwrap(); // retire 1
 
         let retained: Vec<u64> = clock.retained_epochs().collect();
         assert!(retained.contains(&0));
