@@ -70,11 +70,17 @@ impl RingRegistration {
 
     /// Register arenas as fixed buffers with the io_uring submitter.
     /// Allocates slots for each arena and builds the iovec array.
+    ///
+    /// Expects a clean slot state — call `unregister()` first if re-registering.
     pub fn register<'a>(
         &mut self,
         submitter: &io_uring::Submitter<'_>,
         arenas: impl Iterator<Item = (ArenaIdx, &'a Arena)>,
     ) -> Result<()> {
+        debug_assert!(
+            self.arena_slot_map.iter().all(|s| s.is_none()),
+            "register() called with existing slot mappings — call unregister() first"
+        );
         // Build iovec array with capacity for all slots (empty slots get zeroed iovecs)
         let mut iovecs: Vec<libc::iovec> = vec![
             libc::iovec {
@@ -111,13 +117,12 @@ impl RingRegistration {
     /// Unregister previously registered buffers.
     ///
     /// Frees all allocated slots and clears the arena-to-slot mapping so that
-    /// a subsequent `register()` call starts fresh without leaking slots.
+    /// a subsequent `register()` call rebuilds from scratch.
     pub fn unregister(&mut self, submitter: &io_uring::Submitter<'_>) -> Result<()> {
         if self.registered {
             submitter
                 .unregister_buffers()
                 .map_err(TurbineError::Registration)?;
-            // Free all allocated slots so they can be reused on next register().
             for slot_opt in self.arena_slot_map.iter_mut() {
                 if let Some(slot) = slot_opt.take() {
                     self.slots.free(slot);
@@ -292,40 +297,39 @@ mod tests {
     }
 
     #[test]
-    fn unregister_frees_slots_for_reuse() {
-        // Simulate the unregister→register cycle without a real io_uring submitter
-        // by directly testing that slot allocations are freed when arena_slot_map is cleared.
+    fn unregister_clears_slots_for_register_cycle() {
+        // Verify that clearing slots in unregister() allows register() to
+        // rebuild from scratch without slot exhaustion.
         let mut reg = RingRegistration::new(4);
 
-        // Allocate all 4 slots.
+        // Allocate all 4 slots via register_arena (simulating what register() does).
         for i in 0..4 {
             reg.register_arena(ArenaIdx::new(i)).unwrap();
         }
-        assert!(reg.register_arena(ArenaIdx::new(4)).is_err(), "slots should be full");
+        assert!(reg.register_arena(ArenaIdx::new(4)).is_err(), "slots full");
 
-        // Simulate unregister: free all slots and clear the map.
+        // Simulate unregister(): free all slots and clear the map.
         for slot_opt in reg.arena_slot_map.iter_mut() {
             if let Some(slot) = slot_opt.take() {
                 reg.slots.free(slot);
             }
         }
-        reg.registered = false;
 
-        // Now re-register — should succeed because slots were freed.
+        // Now register_arena() should work again (simulating register() rebuild).
         for i in 0..4 {
             reg.register_arena(ArenaIdx::new(i)).unwrap();
         }
-        assert!(reg.register_arena(ArenaIdx::new(4)).is_err(), "slots should be full again");
+        assert!(reg.register_arena(ArenaIdx::new(4)).is_err(), "slots full again");
 
-        // Repeat the cycle 10 times to prove no leak.
-        for _ in 0..10 {
+        // Repeat 10 cycles to prove no leak.
+        for cycle in 0..10 {
             for slot_opt in reg.arena_slot_map.iter_mut() {
                 if let Some(slot) = slot_opt.take() {
                     reg.slots.free(slot);
                 }
             }
             for i in 0..4 {
-                reg.register_arena(ArenaIdx::new(i)).unwrap();
+                reg.register_arena(ArenaIdx::new(cycle * 4 + i)).unwrap();
             }
         }
     }
