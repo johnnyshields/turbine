@@ -23,6 +23,15 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bin]]
 name = "flamegraph_lease"
 
+[[bin]]
+name = "flamegraph_rotate"
+
+[[bin]]
+name = "flamegraph_cross_thread"
+
+[[bin]]
+name = "flamegraph_collect"
+
 [[bench]]
 name = "lease_throughput"
 harness = false
