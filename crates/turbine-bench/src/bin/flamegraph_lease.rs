@@ -1,3 +1,4 @@
+use std::env;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
@@ -11,7 +12,16 @@ use turbine_core::gc::NoopHooks;
 /// clean shutdown, rare enough to stay off the flamegraph.
 const CLOCK_CHECK_INTERVAL: u64 = 100_000;
 
+fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
+    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
 fn main() {
+    let duration_secs: u64 = env_or("FLAMEGRAPH_DURATION_SECS", 5);
+    let buf_size: usize = env_or("FLAMEGRAPH_BUF_SIZE", 64);
+    let output_path: String =
+        env_or("FLAMEGRAPH_OUTPUT", "target/flamegraph-lease.svg".to_string());
+
     let config = PoolConfig {
         arena_size: 4096 * 64, // 256 KiB — plenty of room
         initial_arenas: 3,
@@ -22,7 +32,7 @@ fn main() {
 
     // Warm up
     for _ in 0..1_000 {
-        let buf = pool.lease(64).unwrap();
+        let buf = pool.lease(buf_size).unwrap();
         black_box(&buf);
         drop(buf);
     }
@@ -32,7 +42,7 @@ fn main() {
         .build()
         .expect("failed to start profiler");
 
-    let duration = Duration::from_secs(5);
+    let duration = Duration::from_secs(duration_secs);
     let start = Instant::now();
     let mut iters = 0u64;
 
@@ -41,12 +51,12 @@ fn main() {
     // the profiler but keeps us bounded to wall-clock time.
     'outer: loop {
         for _ in 0..CLOCK_CHECK_INTERVAL {
-            let buf = match pool.lease(64) {
+            let buf = match pool.lease(buf_size) {
                 Some(buf) => buf,
                 None => {
                     pool.rotate().unwrap();
                     pool.collect();
-                    pool.lease(64).expect("fresh arena should have space")
+                    pool.lease(buf_size).expect("fresh arena should have space")
                 }
             };
             black_box(&buf);
@@ -69,7 +79,7 @@ fn main() {
     let mut opts = Options::default();
     opts.title = "Turbine lease() hot path".to_string();
 
-    let file = std::fs::File::create("flamegraph-lease.svg").unwrap();
+    let file = std::fs::File::create(&output_path).unwrap();
     report.flamegraph_with_options(file, &mut opts).unwrap();
-    eprintln!("Wrote flamegraph-lease.svg");
+    eprintln!("Wrote {output_path}");
 }
