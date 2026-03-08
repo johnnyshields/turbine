@@ -78,3 +78,50 @@ Measured on Linux (WSL2), Rust 1.94 release profile. Numbers are per-operation m
 **Epoch lifecycle (~225–293 ns for a full rotate+collect cycle).** Very low overhead for the complete epoch management cycle: lease a batch of buffers, rotate to a new epoch, drop all leases, and collect the retired arena.
 
 **Key takeaway.** Turbine now matches bumpalo at raw allocation speed (~2 ns) while providing features bumpalo cannot: epoch-based lifecycle management, individual buffer lifetimes, cross-thread transfer via `SendableBuffer`, and io_uring fixed-buffer registration. BytesPool is ~4x slower at allocation despite being a simpler free-list design. Turbine occupies an unserved niche — the fastest bump allocator with the lifetime management required for async io_uring workflows.
+
+## Flamegraph Profiling
+
+Turbine ships six flamegraph binaries in `turbine-bench` that isolate individual hot paths for profiling with `pprof`. Each binary runs for 5 seconds (configurable via `FLAMEGRAPH_DURATION_SECS`) and writes an SVG to `target/`.
+
+### Running
+
+```bash
+# Run all flamegraphs
+cargo run --release --bin flamegraph_lease
+cargo run --release --bin flamegraph_rotate
+cargo run --release --bin flamegraph_collect
+cargo run --release --bin flamegraph_spsc
+cargo run --release --bin flamegraph_cross_thread
+cargo run --release --bin flamegraph_iouring
+```
+
+SVGs are written to `target/flamegraph-{lease,rotate,collect,spsc,cross-thread,iouring}.svg`.
+
+### Results
+
+Measured on Linux (WSL2), Rust 1.94 release profile, 64-byte buffers, 5-second runs.
+
+| Binary | What it measures | Throughput | Per-iter |
+|--------|-----------------|-----------|----------|
+| `flamegraph_lease` | `lease()` + drop tight loop | 2.09B iters/5s | **2.4 ns** |
+| `flamegraph_rotate` | `lease()` until full, then `rotate()` | 1.63B iters (25.4M rotations)/5s | **3.1 ns** |
+| `flamegraph_collect` | `collect()` with active drain queue (50 arenas) | 123.7M iters (2.5M rebuilds)/5s | **40.4 ns** |
+| `flamegraph_spsc` | Producer lease+send via lock-free SPSC ring, consumer drop | 46.6M sends/5s | **107.4 ns** |
+| `flamegraph_cross_thread` | Same as SPSC but over crossbeam bounded channel | 33.7M sends/5s | **148.3 ns** |
+| `flamegraph_iouring` | `write_fixed` submissions through io_uring | 17.5M iters/5s | **285.4 ns** |
+
+### Flamegraph Analysis
+
+**`flamegraph_lease` (2.4 ns/iter).** The entire hot path is inlined — no Turbine functions appear in samples. Only `rotate()` (0.16%) and `clock_gettime` (0.24%) are visible. The lease path (arena lookup, bump allocation, lease counting, buf_id assignment) compiles down to a handful of instructions with zero function call overhead.
+
+**`flamegraph_rotate` (3.1 ns/iter).** `rotate()` accounts for 4.5% of total time, with `collect()` consuming ~52% of that. `advise_free_unused` (madvise) is negligible at 0.16%. The amortized rotation cost is ~0.6 ns per iteration — the loop is dominated by the lease path which is fully inlined.
+
+**`flamegraph_collect` (40.4 ns/iter).** `collect()` dominates at ~70% of samples, which is expected — it scans the drain queue, checks lease counts (Relaxed + Acquire ordering), runs madvise, and manages the free pool. The remaining ~24% is `build_drain_queue` (benchmark harness rebuilding the drain queue via rotate+lease). The `swap_remove` loop is tight with no allocation overhead.
+
+**`flamegraph_spsc` (107.4 ns/iter).** Uses a custom lock-free SPSC ring with cache-line-padded head/tail atomics. The hot path (lease → `into_sendable` → ring push / ring pop → `SendableBuffer::drop` with `fetch_add`) is fully inlined. The 107 ns cost is the fundamental price of cross-core atomic coordination (Release/Acquire on head/tail + the `remote_returns` `fetch_add` on drop).
+
+**`flamegraph_cross_thread` (148.3 ns/iter).** Uses `crossbeam_channel::bounded`. ~50% of producer time is in `Sender::send`, ~15% in `SyncWaker::notify` (futex syscalls), ~4% in `sched_yield`. The ~40 ns delta vs SPSC (148 vs 107 ns) is entirely crossbeam channel overhead (futex wake/notify). No Turbine functions appear as hotspots — the buffer pool is not the bottleneck.
+
+**`flamegraph_iouring` (285.4 ns/iter).** 78.5% of time is in the `syscall` instruction (io_uring submit + wait). `register()` is 2.75% and `unregister()` is 1.86% (both one-time init/cleanup costs). `collect()` is 0.65%. Turbine userspace overhead is under 5% of total — the kernel dominates, which is the expected profile for an io_uring write path.
+
+**Summary.** No optimization opportunities were identified in Turbine code. The hot paths (`lease`, `rotate`, `collect`) are tight and well-inlined. The heavier benchmarks are dominated by factors outside Turbine's control: kernel syscalls (io_uring), cross-core atomic coordination (SPSC), and crossbeam channel overhead (cross_thread).
