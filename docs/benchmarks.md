@@ -73,13 +73,13 @@ Measured on Linux (WSL2), Rust 1.94 release profile. Numbers are per-operation m
 
 ## Analysis
 
-**Lease throughput (~2 ns, constant across all sizes).** After hot-path optimization (fused arena+index lookup, `unsafe` removal of panic branches, `#[inline(always)]` on the entire lease path, cold-path extraction), turbine now matches bumpalo's raw bump allocation speed. The ~2 ns flat latency across all buffer sizes — from 64 B to 64 KiB — confirms the bump allocator is fully inlined with zero overhead from epoch tracking, lease counting, buf_id assignment, and registration slot lookup. This represents a **5–10x improvement** over the pre-optimization baseline (~10–19 ns).
+**Lease throughput (~2 ns, constant across all sizes).** Turbine's bump allocator delivers flat latency regardless of buffer size — from 64 B to 64 KiB — confirming that epoch tracking, lease counting, buf_id assignment, and registration slot lookup add zero overhead to the hot path. Turbine is the fastest pool at every size point, beating bumpalo (which scales linearly with allocation size due to memcpy) and BytesPool (~8 ns free-list overhead).
 
 **Cross-thread transfer (~170–186 ns).** Turbine beats every competitor at every buffer size and dominates at 64 KiB (170 ns vs 1.1 μs for Vec baseline — a 6.5x advantage). Turbine transfers a lightweight `SendableBuffer` handle (pointer + metadata) rather than moving heap data, so cost stays nearly constant as buffer size grows. The gap widens with buffer size — exactly the use case turbine targets, since io_uring buffers tend to be 4–64 KiB.
 
 **Epoch lifecycle (~225–293 ns for a full rotate+collect cycle).** Very low overhead for the complete epoch management cycle: lease a batch of buffers, rotate to a new epoch, drop all leases, and collect the retired arena.
 
-**Key takeaway.** Turbine now matches bumpalo at raw allocation speed (~2 ns) while providing features bumpalo cannot: epoch-based lifecycle management, individual buffer lifetimes, cross-thread transfer via `SendableBuffer`, and io_uring fixed-buffer registration. BytesPool is ~4x slower at allocation despite being a simpler free-list design. Turbine occupies an unserved niche — the fastest bump allocator with the lifetime management required for async io_uring workflows.
+**Key takeaway.** Turbine is the fastest pool at both allocation and cross-thread transfer across all buffer sizes tested. It occupies an unserved niche — the fastest bump allocator with the lifetime management required for async io_uring workflows. BytesPool is ~4x slower at allocation despite being a simpler free-list design, and every competitor's cross-thread cost scales with buffer size while Turbine's stays nearly flat.
 
 ## Flamegraph Profiling
 
