@@ -3,6 +3,11 @@ use crate::epoch::arena::{Arena, ArenaState};
 use crate::error::{Result, TurbineError};
 use crate::ArenaIdx;
 
+/// If a draining arena retired within this many epochs of the current epoch
+/// still has outstanding leases, skip checking younger arenas — they almost
+/// certainly have leases too. Skipped arenas are rechecked on the next collect().
+const COLLECT_YOUNG_EPOCHS: u64 = 2;
+
 /// Result of a rotate operation.
 #[derive(Debug)]
 pub struct RotateResult {
@@ -123,13 +128,23 @@ impl ArenaManager {
     /// number of arenas collected.
     pub fn collect(&mut self) -> usize {
         let mut collected = 0;
+        let current_epoch = self.epoch;
         let arenas = &self.arenas;
         let free_pool = &mut self.free_pool;
         let page_size = self.page_size;
+        let mut skip_remaining = false;
         self.draining.retain(|&idx| {
+            if skip_remaining {
+                return true;
+            }
             let arena = arenas[idx.as_usize()].as_ref().expect("draining arena missing");
             // Fast path: skip Acquire barrier when leases are clearly outstanding
             if arena.has_outstanding_leases() {
+                // If this arena is young (recently retired) and still has leases,
+                // younger arenas almost certainly do too — skip the rest.
+                if arena.epoch() >= current_epoch.saturating_sub(COLLECT_YOUNG_EPOCHS) {
+                    skip_remaining = true;
+                }
                 return true; // keep in draining
             }
             // Slow path: Acquire-ordered check for definitive answer
@@ -140,6 +155,10 @@ impl ArenaManager {
                 collected += 1;
                 false
             } else {
+                // Lease count > 0 on slow path — also check for early termination.
+                if arena.epoch() >= current_epoch.saturating_sub(COLLECT_YOUNG_EPOCHS) {
+                    skip_remaining = true;
+                }
                 true
             }
         });
