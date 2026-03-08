@@ -42,7 +42,7 @@ crates/
     benches/
       lease_throughput.rs
       cross_thread_transfer.rs
-      epoch_lifecycle.rs
+      epoch_rotation.rs
     src/                  # Competitor implementations for comparison
 docs/                    # Documentation
 lore/                    # Implementation notes and research

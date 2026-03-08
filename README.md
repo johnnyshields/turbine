@@ -100,3 +100,4 @@ Default config: 4 arenas x 2 MiB = 8 MiB total. See
 - [Architecture](docs/architecture.md) -- Internals, buffer types, soundness
 - [Benchmarks](docs/benchmarks.md) -- Performance data, flamegraphs, profiling
 - [Contributing](docs/contributing.md) -- Building, testing, project layout
+- [Future Work](docs/future.md) -- Planned improvements
