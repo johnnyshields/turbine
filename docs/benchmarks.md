@@ -1,5 +1,7 @@
 # Turbine Benchmarks
 
+See also: [User Guide](guide.md) for configuration tuning, [Integration Guide](integration.md) for runtime-specific setup.
+
 Turbine ships a benchmark suite (`turbine-bench`) comparing its allocation, cross-thread transfer, and epoch lifecycle performance against common buffer pool alternatives.
 
 ## Running Benchmarks
@@ -244,7 +246,8 @@ The only Turbine-adjacent allocation is `build_drain_queue` in the collect bench
 
 ## PGO (Profile-Guided Optimization)
 
-Turbine already ships with `lto = "thin"` and `codegen-units = 1`. PGO adds branch layout optimization based on actual runtime profiles. Since PGO is a binary-level optimization, it must be applied in the downstream project (see [integration guide](integration.md#build-optimization-pgo--thin-lto)).
+PGO adds branch layout optimization based on actual runtime profiles. See the
+[User Guide](guide.md#build-optimization) for build steps and when to use PGO.
 
 ### Measured Impact
 
@@ -255,14 +258,5 @@ Turbine already ships with `lto = "thin"` and `codegen-units = 1`. PGO adds bran
 | collect | 49.0 ns | 31.5 ns | **-36%** |
 | spsc | 89.6 ns | 100.2 ns | noise |
 
-### Analysis
-
-**Rotate improved 27%.** PGO optimized branch layout in the rotate→collect→lease cycle, placing the free-pool-hit path (the common case) on the fall-through.
-
-**Collect improved 36%.** PGO optimized the drain queue scanning loop — the `has_outstanding_leases()` branch (mostly-true during active draining) gets better prediction from profile-informed layout.
-
-**Lease unchanged.** The lease path is already fully inlined and branch-free in the hot loop — PGO has nothing to improve.
-
-**SPSC noise.** Cross-thread benchmarks are inherently noisy due to cache coherence timing.
-
-**Verdict.** PGO is worth enabling for production builds where `rotate()` and `collect()` are hot. See [integration guide](integration.md#build-optimization-pgo--thin-lto) for build steps.
+**Verdict.** PGO is worth enabling for production builds where `rotate()` and
+`collect()` are hot.
