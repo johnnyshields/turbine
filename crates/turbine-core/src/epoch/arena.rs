@@ -197,7 +197,7 @@ impl Arena {
     }
 
     /// Hint to OS that unused pages can be reclaimed.
-    /// Called when arena enters draining state.
+    /// Called during `collect()` when an arena has zero outstanding leases.
     #[cold]
     pub fn advise_free_unused(&self, page_size: usize) {
         let used = self.offset.get();
@@ -372,6 +372,34 @@ mod tests {
 
         arena.remote_release();
         assert_eq!(arena.lease_count(), 0);
+    }
+
+    #[test]
+    fn has_outstanding_leases_after_reset() {
+        let arena = Arena::new(4096).unwrap();
+
+        // Acquire leases and verify outstanding.
+        arena.acquire_lease();
+        arena.acquire_lease();
+        assert!(arena.has_outstanding_leases());
+
+        // Simulate cross-thread returns.
+        arena.remote_release();
+        assert!(arena.has_outstanding_leases());
+
+        arena.remote_release();
+        assert!(!arena.has_outstanding_leases());
+
+        // Reset should clear everything.
+        arena.reset();
+        assert!(!arena.has_outstanding_leases());
+
+        // New leases post-reset should be tracked correctly.
+        arena.acquire_lease();
+        assert!(arena.has_outstanding_leases());
+
+        arena.release_lease();
+        assert!(!arena.has_outstanding_leases());
     }
 
     #[test]

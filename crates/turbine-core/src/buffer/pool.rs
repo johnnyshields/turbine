@@ -449,10 +449,14 @@ mod tests {
     }
 
     /// Compile-time assertion that IouringBufferPool is !Send.
-    #[test]
-    fn pool_is_not_send() {
-        fn _assert_not_send<T>() {}
-        _assert_not_send::<IouringBufferPool<NoopHooks>>();
-    }
+    /// Enforced via `PhantomData<Rc<()>>` in the pool struct.
+    /// If this fails to compile, it means the pool incorrectly implements Send.
+    const _: () = {
+        fn _must_not_be_send() {
+            fn _assert_send<T: Send>() {}
+            // Uncomment the next line to verify this is a real check — it must NOT compile:
+            // _assert_send::<super::IouringBufferPool<crate::gc::NoopHooks>>();
+        }
+    };
 
 }

@@ -545,6 +545,46 @@ mod tests {
         assert_eq!(mgr.draining_count(), 0);
     }
 
+    #[test]
+    fn collect_with_remote_returns() {
+        let mut mgr = ArenaManager::new(&test_config()).unwrap();
+
+        // Acquire leases on arena 0 (simulating buffers sent cross-thread).
+        mgr.current_arena().acquire_lease();
+        mgr.current_arena().acquire_lease();
+        let arena0_idx = mgr.current_arena_idx();
+
+        mgr.rotate().unwrap(); // arena 0 → draining with 2 leases
+
+        // Acquire a lease on arena 1 too.
+        mgr.current_arena().acquire_lease();
+        let arena1_idx = mgr.current_arena_idx();
+
+        mgr.rotate().unwrap(); // arena 1 → draining with 1 lease
+
+        assert_eq!(mgr.draining_count(), 2);
+
+        // Simulate cross-thread release of one lease on arena 0.
+        // has_outstanding_leases() fast path: local=2, remote=1 → true (still outstanding).
+        mgr.arena_at(arena0_idx).unwrap().remote_release();
+        let collected = mgr.collect();
+        assert_eq!(collected, 0); // both arenas still have outstanding leases
+        assert_eq!(mgr.draining_count(), 2);
+
+        // Release remaining lease on arena 0 via remote path.
+        // has_outstanding_leases() fast path: local=2, remote=2 → false → enters slow path.
+        mgr.arena_at(arena0_idx).unwrap().remote_release();
+        let collected = mgr.collect();
+        assert_eq!(collected, 1); // arena 0 collected, arena 1 still held
+        assert_eq!(mgr.draining_count(), 1);
+
+        // Release arena 1's lease locally.
+        mgr.arena_at(arena1_idx).unwrap().release_lease();
+        let collected = mgr.collect();
+        assert_eq!(collected, 1);
+        assert_eq!(mgr.draining_count(), 0);
+    }
+
     /// Helper: assert the unsafe invariant that `arenas[write_idx]` is `Some`.
     fn assert_write_idx_valid(mgr: &ArenaManager) {
         let idx = mgr.write_idx.as_usize();
