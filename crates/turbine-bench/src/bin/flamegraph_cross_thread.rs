@@ -1,3 +1,13 @@
+//! Cross-thread buffer transfer benchmark via crossbeam bounded channel.
+//!
+//! Flamegraph findings:
+//! - crossbeam bounded(64): ~185ns/iter, ~50% of samples in futex syscalls
+//!   (crossbeam's waker/notification path, not Turbine)
+//! - SPSC ring (`flamegraph_spsc`): ~120ns/iter, no syscalls
+//!
+//! The overhead here is crossbeam's synchronization, not Turbine's transfer.
+//! Use `flamegraph_spsc` to isolate raw Turbine `into_sendable()` + drop cost.
+
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 

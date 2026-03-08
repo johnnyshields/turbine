@@ -3,11 +3,6 @@ use crate::epoch::arena::{Arena, ArenaState};
 use crate::error::{Result, TurbineError};
 use crate::ArenaIdx;
 
-/// If a draining arena retired within this many epochs of the current epoch
-/// still has outstanding leases, skip checking younger arenas — they almost
-/// certainly have leases too. Skipped arenas are rechecked on the next collect().
-const COLLECT_YOUNG_EPOCHS: u64 = 2;
-
 /// Result of a rotate operation.
 #[derive(Debug)]
 pub struct RotateResult {
@@ -25,7 +20,7 @@ pub struct RotateResult {
 pub struct ArenaManager {
     arenas: Vec<Option<Box<Arena>>>, // slab, stable addresses via Box
     write_idx: ArenaIdx,
-    draining: Vec<ArenaIdx>,  // slab indices, oldest first
+    draining: Vec<ArenaIdx>,  // slab indices, unordered (swap_remove)
     free_pool: Vec<ArenaIdx>, // slab indices ready for reuse
     live_count: usize,        // O(1) count of non-None slab entries
     epoch: u64,
@@ -128,40 +123,37 @@ impl ArenaManager {
     /// number of arenas collected.
     pub fn collect(&mut self) -> usize {
         let mut collected = 0;
-        let current_epoch = self.epoch;
-        let arenas = &self.arenas;
-        let free_pool = &mut self.free_pool;
-        let page_size = self.page_size;
-        let mut skip_remaining = false;
-        self.draining.retain(|&idx| {
-            if skip_remaining {
-                return true;
-            }
-            let arena = arenas[idx.as_usize()].as_ref().expect("draining arena missing");
-            // Fast path: skip Acquire barrier when leases are clearly outstanding
+        let mut i = 0;
+        // Snapshot: if the free pool is already well-stocked, collected arenas
+        // will be reused soon (or shrink()'d away), so skip the madvise syscall.
+        let skip_madvise = self.free_pool.len() >= self.max_free;
+        while i < self.draining.len() {
+            let idx = self.draining[i];
+            let arena = self.arenas[idx.as_usize()]
+                .as_ref()
+                .expect("draining arena missing");
             if arena.has_outstanding_leases() {
-                // If this arena is young (recently retired) and still has leases,
-                // younger arenas almost certainly do too — skip the rest.
-                if arena.epoch() >= current_epoch.saturating_sub(COLLECT_YOUNG_EPOCHS) {
-                    skip_remaining = true;
-                }
-                return true; // keep in draining
+                i += 1;
+                continue;
             }
-            // Slow path: Acquire-ordered check for definitive answer
-            if arena.lease_count() == 0 {
-                arena.advise_free_unused(page_size);
-                arena.set_state(ArenaState::Collected);
-                free_pool.push(idx);
-                collected += 1;
-                false
-            } else {
-                // Lease count > 0 on slow path — also check for early termination.
-                if arena.epoch() >= current_epoch.saturating_sub(COLLECT_YOUNG_EPOCHS) {
-                    skip_remaining = true;
-                }
-                true
+            // Relaxed check passed → do Acquire-ordered confirmation.
+            // In practice lease_count() is always 0 here (Relaxed said
+            // local <= remote, invariant says local >= remote → local == remote),
+            // but the Acquire fence is needed to synchronize with cross-thread
+            // Release stores before we act on the arena.
+            if arena.lease_count() != 0 {
+                i += 1;
+                continue;
             }
-        });
+            if !skip_madvise {
+                arena.advise_free_unused(self.page_size);
+            }
+            arena.set_state(ArenaState::Collected);
+            self.free_pool.push(idx);
+            collected += 1;
+            self.draining.swap_remove(i);
+            // don't increment — swapped element needs checking
+        }
         collected
     }
 
@@ -605,10 +597,9 @@ mod tests {
     }
 
     #[test]
-    fn collect_early_termination_skips_young() {
-        // Verify that collect() skips younger arenas once a young arena with
-        // outstanding leases triggers the early termination heuristic, and that
-        // skipped arenas are still collected on subsequent calls.
+    fn collect_swap_remove_collects_all() {
+        // Verify that swap_remove-based collect() finds all zero-lease arenas
+        // regardless of their position in the drain queue.
         let config = PoolConfig {
             arena_size: 4096,
             initial_arenas: 1,
@@ -619,8 +610,7 @@ mod tests {
         };
         let mut mgr = ArenaManager::new(&config).unwrap();
 
-        // Build up several epochs so we have old and young draining arenas.
-        // Hold leases on all of them to prevent collection.
+        // Build up several epochs, hold leases on all.
         let mut leased = Vec::new();
         for _ in 0..6 {
             let idx = mgr.current_arena_idx();
@@ -628,42 +618,25 @@ mod tests {
             leased.push(idx);
             mgr.rotate().unwrap();
         }
-        // Now: epoch=6, draining=[0,1,2,3,4,5] all with leases held.
         assert_eq!(mgr.draining_count(), 6);
-        assert_eq!(mgr.epoch(), 6);
 
-        // Release leases on the OLD arenas (epochs 0,1,2) but keep leases on
-        // YOUNG arenas (epochs 3,4,5 — within COLLECT_YOUNG_EPOCHS=2 of epoch 6).
-        for &idx in &leased[..3] {
-            mgr.arena_at(idx).unwrap().release_lease();
-        }
+        // Release leases on arenas 0, 2, 4 (interleaved positions).
+        mgr.arena_at(leased[0]).unwrap().release_lease();
+        mgr.arena_at(leased[2]).unwrap().release_lease();
+        mgr.arena_at(leased[4]).unwrap().release_lease();
 
-        // First collect: should collect old arenas (0,1,2) then hit arena 3
-        // (epoch 3, still has lease). Arena 3 is young relative to epoch 6
-        // (6-3=3 > COLLECT_YOUNG_EPOCHS=2), so it won't trigger early term.
-        // Arena 4 (epoch 4, 6-4=2 == COLLECT_YOUNG_EPOCHS) WILL trigger early
-        // termination, skipping arena 5.
+        // Collect should find all 3 regardless of queue ordering.
         let collected = mgr.collect();
-        assert_eq!(collected, 3, "old arenas 0,1,2 should be collected");
-        // Arenas 3,4,5 remain draining. Early termination skipped arena 5.
+        assert_eq!(collected, 3);
         assert_eq!(mgr.draining_count(), 3);
 
-        // Release arena 3's lease. Arenas 4,5 still have leases.
+        // Release remaining leases and collect the rest.
+        mgr.arena_at(leased[1]).unwrap().release_lease();
         mgr.arena_at(leased[3]).unwrap().release_lease();
-
-        // Second collect: arena 3 (no lease) collected. Arena 4 (young, has
-        // lease) triggers early termination, skipping arena 5.
-        let collected = mgr.collect();
-        assert_eq!(collected, 1, "arena 3 should be collected");
-        assert_eq!(mgr.draining_count(), 2);
-
-        // Release remaining leases.
-        mgr.arena_at(leased[4]).unwrap().release_lease();
         mgr.arena_at(leased[5]).unwrap().release_lease();
 
-        // Final collect: both should be collected now.
         let collected = mgr.collect();
-        assert_eq!(collected, 2, "arenas 4,5 should be collected");
+        assert_eq!(collected, 3);
         assert_eq!(mgr.draining_count(), 0);
     }
 
