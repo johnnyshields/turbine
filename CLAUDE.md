@@ -56,4 +56,5 @@ These are load-bearing and must not be weakened:
 - Epoch lifecycle: Writable → Retired → Collected → recycled
 - Tests use `NoopHooks` and `PoolConfig { arena_size: 4096, initial_arenas: 3, ..defaults }`
 - Arena minimum count is 1 (one writable); draining arenas accumulate in drain queue
+- Arena uses `#[repr(C)]` with `CacheAligned<T>` to isolate `remote_returns` on its own cache line — do not reorder fields or remove the padding wrapper
 - See `lore/conventions.md` for extended conventions

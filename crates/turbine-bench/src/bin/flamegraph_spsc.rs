@@ -68,7 +68,13 @@ impl<T> SpscRing<T> {
             if tail != head {
                 break;
             }
-            if self.closed.load(Ordering::Relaxed) {
+            if self.closed.load(Ordering::Acquire) {
+                // Re-load tail with Acquire to catch items pushed between our
+                // last tail check and the close() Release store.
+                let final_tail = self.tail.0.load(Ordering::Acquire);
+                if final_tail != head {
+                    break;
+                }
                 return None;
             }
             std::hint::spin_loop();
@@ -80,6 +86,20 @@ impl<T> SpscRing<T> {
 
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
+    }
+}
+
+impl<T> Drop for SpscRing<T> {
+    fn drop(&mut self) {
+        // Drain any items remaining in the ring so they are properly dropped.
+        // This is critical for SendableBuffer, whose Drop triggers remote_release.
+        let head = *self.head.0.get_mut();
+        let tail = *self.tail.0.get_mut();
+        for i in head..tail {
+            unsafe {
+                (*self.buf[i & RING_MASK].get()).assume_init_drop();
+            }
+        }
     }
 }
 

@@ -604,6 +604,69 @@ mod tests {
         assert_eq!(mgr.draining_count(), 0);
     }
 
+    #[test]
+    fn collect_early_termination_skips_young() {
+        // Verify that collect() skips younger arenas once a young arena with
+        // outstanding leases triggers the early termination heuristic, and that
+        // skipped arenas are still collected on subsequent calls.
+        let config = PoolConfig {
+            arena_size: 4096,
+            initial_arenas: 1,
+            max_free_arenas: 16,
+            max_total_arenas: 0,
+            registration_slots: 32,
+            page_size: 4096,
+        };
+        let mut mgr = ArenaManager::new(&config).unwrap();
+
+        // Build up several epochs so we have old and young draining arenas.
+        // Hold leases on all of them to prevent collection.
+        let mut leased = Vec::new();
+        for _ in 0..6 {
+            let idx = mgr.current_arena_idx();
+            mgr.current_arena().acquire_lease();
+            leased.push(idx);
+            mgr.rotate().unwrap();
+        }
+        // Now: epoch=6, draining=[0,1,2,3,4,5] all with leases held.
+        assert_eq!(mgr.draining_count(), 6);
+        assert_eq!(mgr.epoch(), 6);
+
+        // Release leases on the OLD arenas (epochs 0,1,2) but keep leases on
+        // YOUNG arenas (epochs 3,4,5 — within COLLECT_YOUNG_EPOCHS=2 of epoch 6).
+        for &idx in &leased[..3] {
+            mgr.arena_at(idx).unwrap().release_lease();
+        }
+
+        // First collect: should collect old arenas (0,1,2) then hit arena 3
+        // (epoch 3, still has lease). Arena 3 is young relative to epoch 6
+        // (6-3=3 > COLLECT_YOUNG_EPOCHS=2), so it won't trigger early term.
+        // Arena 4 (epoch 4, 6-4=2 == COLLECT_YOUNG_EPOCHS) WILL trigger early
+        // termination, skipping arena 5.
+        let collected = mgr.collect();
+        assert_eq!(collected, 3, "old arenas 0,1,2 should be collected");
+        // Arenas 3,4,5 remain draining. Early termination skipped arena 5.
+        assert_eq!(mgr.draining_count(), 3);
+
+        // Release arena 3's lease. Arenas 4,5 still have leases.
+        mgr.arena_at(leased[3]).unwrap().release_lease();
+
+        // Second collect: arena 3 (no lease) collected. Arena 4 (young, has
+        // lease) triggers early termination, skipping arena 5.
+        let collected = mgr.collect();
+        assert_eq!(collected, 1, "arena 3 should be collected");
+        assert_eq!(mgr.draining_count(), 2);
+
+        // Release remaining leases.
+        mgr.arena_at(leased[4]).unwrap().release_lease();
+        mgr.arena_at(leased[5]).unwrap().release_lease();
+
+        // Final collect: both should be collected now.
+        let collected = mgr.collect();
+        assert_eq!(collected, 2, "arenas 4,5 should be collected");
+        assert_eq!(mgr.draining_count(), 0);
+    }
+
     /// Helper: assert the unsafe invariant that `arenas[write_idx]` is `Some`.
     fn assert_write_idx_valid(mgr: &ArenaManager) {
         let idx = mgr.write_idx.as_usize();
