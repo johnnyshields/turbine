@@ -15,8 +15,13 @@ crossbeam-channel = "0.5"
 bumpalo = "3"
 bytes = "1"
 
+pprof = { version = "0.14", features = ["flamegraph"] }
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bin]]
+name = "flamegraph_lease"
 
 [[bench]]
 name = "lease_throughput"
