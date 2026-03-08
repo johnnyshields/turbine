@@ -1,8 +1,7 @@
-use std::env;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use pprof::flamegraph::Options;
+use turbine_bench::{env_or, profiler_guard, write_flamegraph};
 use turbine_core::buffer::leased::LeasedBuffer;
 use turbine_core::buffer::pool::IouringBufferPool;
 use turbine_core::config::PoolConfig;
@@ -12,10 +11,6 @@ use turbine_core::gc::NoopHooks;
 /// collect() scans the entire drain queue (~1-10µs per call), so 1k iters
 /// keeps the check cost negligible.
 const CLOCK_CHECK_INTERVAL: u64 = 1_000;
-
-fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
-}
 
 /// Build a large drain queue by rotating many times with held leases.
 /// Returns the held leases (keeping arenas in the drain queue).
@@ -65,10 +60,7 @@ fn main() {
         pool.collect();
     }
 
-    let guard = pprof::ProfilerGuardBuilder::default()
-        .frequency(10_000)
-        .build()
-        .expect("failed to start profiler");
+    let guard = profiler_guard();
 
     let duration = Duration::from_secs(duration_secs);
     let start = Instant::now();
@@ -103,11 +95,5 @@ fn main() {
         elapsed.as_nanos() as f64 / iters as f64,
     );
 
-    let report = guard.report().build().unwrap();
-    let mut opts = Options::default();
-    opts.title = "Turbine collect() drain queue hot path".to_string();
-
-    let file = std::fs::File::create(&output_path).unwrap();
-    report.flamegraph_with_options(file, &mut opts).unwrap();
-    eprintln!("Wrote {output_path}");
+    write_flamegraph(guard, "Turbine collect() drain queue hot path", &output_path);
 }

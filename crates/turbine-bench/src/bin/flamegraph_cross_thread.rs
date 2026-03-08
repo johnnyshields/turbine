@@ -1,9 +1,8 @@
-use std::env;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, Sender};
-use pprof::flamegraph::Options;
+use turbine_bench::{env_or, profiler_guard, write_flamegraph};
 use turbine_core::buffer::pool::IouringBufferPool;
 use turbine_core::config::PoolConfig;
 use turbine_core::gc::NoopHooks;
@@ -12,10 +11,6 @@ use turbine_core::transfer::handle::SendableBuffer;
 /// Check the wall clock every this many iterations.
 /// Channel send is ~50-100ns, so 10k iters ≈ 0.5-1ms.
 const CLOCK_CHECK_INTERVAL: u64 = 10_000;
-
-fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
-}
 
 fn producer_loop(
     pool: &IouringBufferPool<NoopHooks>,
@@ -87,10 +82,7 @@ fn main() {
     // Drain warmup buffers
     std::thread::sleep(Duration::from_millis(10));
 
-    let guard = pprof::ProfilerGuardBuilder::default()
-        .frequency(10_000)
-        .build()
-        .expect("failed to start profiler");
+    let guard = profiler_guard();
 
     let duration = Duration::from_secs(duration_secs);
     let (iters, elapsed) = producer_loop(&pool, &tx, buf_size, duration);
@@ -106,11 +98,5 @@ fn main() {
     );
     eprintln!("Consumer: {consumer_count} receives");
 
-    let report = guard.report().build().unwrap();
-    let mut opts = Options::default();
-    opts.title = "Turbine cross-thread transfer hot path".to_string();
-
-    let file = std::fs::File::create(&output_path).unwrap();
-    report.flamegraph_with_options(file, &mut opts).unwrap();
-    eprintln!("Wrote {output_path}");
+    write_flamegraph(guard, "Turbine cross-thread transfer hot path", &output_path);
 }

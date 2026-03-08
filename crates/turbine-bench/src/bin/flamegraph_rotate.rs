@@ -1,19 +1,15 @@
-use std::env;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use pprof::flamegraph::Options;
+use turbine_bench::{env_or, profiler_guard, write_flamegraph};
 use turbine_core::buffer::pool::IouringBufferPool;
 use turbine_core::config::PoolConfig;
 use turbine_core::gc::NoopHooks;
 
 /// Check the wall clock every this many iterations.
-/// Rotation is ~100ns, so 10k iters ≈ 1ms — invisible to the profiler.
+/// Each iteration includes a lease + drop and occasional rotate + collect,
+/// so 10k iters ≈ 1ms — invisible to the profiler.
 const CLOCK_CHECK_INTERVAL: u64 = 10_000;
-
-fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
-}
 
 fn main() {
     let duration_secs: u64 = env_or("FLAMEGRAPH_DURATION_SECS", 5);
@@ -40,10 +36,7 @@ fn main() {
         pool.collect();
     }
 
-    let guard = pprof::ProfilerGuardBuilder::default()
-        .frequency(10_000)
-        .build()
-        .expect("failed to start profiler");
+    let guard = profiler_guard();
 
     let duration = Duration::from_secs(duration_secs);
     let start = Instant::now();
@@ -80,11 +73,5 @@ fn main() {
         elapsed.as_nanos() as f64 / iters as f64,
     );
 
-    let report = guard.report().build().unwrap();
-    let mut opts = Options::default();
-    opts.title = "Turbine rotate() hot path".to_string();
-
-    let file = std::fs::File::create(&output_path).unwrap();
-    report.flamegraph_with_options(file, &mut opts).unwrap();
-    eprintln!("Wrote {output_path}");
+    write_flamegraph(guard, "Turbine rotate() hot path", &output_path);
 }
