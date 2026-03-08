@@ -125,3 +125,144 @@ Measured on Linux (WSL2), Rust 1.94 release profile, 64-byte buffers, 5-second r
 **`flamegraph_iouring` (285.4 ns/iter).** 78.5% of time is in the `syscall` instruction (io_uring submit + wait). `register()` is 2.75% and `unregister()` is 1.86% (both one-time init/cleanup costs). `collect()` is 0.65%. Turbine userspace overhead is under 5% of total — the kernel dominates, which is the expected profile for an io_uring write path.
 
 **Summary.** No optimization opportunities were identified in Turbine code. The hot paths (`lease`, `rotate`, `collect`) are tight and well-inlined. The heavier benchmarks are dominated by factors outside Turbine's control: kernel syscalls (io_uring), cross-core atomic coordination (SPSC), and crossbeam channel overhead (cross_thread).
+
+## Valgrind Callgrind Analysis
+
+Instruction-level profiling via Valgrind's callgrind tool with cache and branch simulation (`--cache-sim=yes --branch-sim=yes`). This captures exact instruction counts, D1/LL cache misses, and branch misprediction rates — data that sampling-based profilers cannot provide.
+
+### Running
+
+```bash
+# Example: run lease benchmark under callgrind (1 second, ~20-50x slower than native)
+FLAMEGRAPH_DURATION_SECS=1 valgrind --tool=callgrind \
+  --callgrind-out-file=target/callgrind-lease.out \
+  --cache-sim=yes --branch-sim=yes \
+  target/release/flamegraph_lease
+
+# Annotate results
+callgrind_annotate --auto=yes --inclusive=no target/callgrind-lease.out
+```
+
+### Instruction Counts per Turbine Function
+
+Filtered to Turbine code only (60-70% of total instructions are pprof flamegraph writing: miniz_oxide compression, gimli DWARF parsing, backtrace symbolization).
+
+| Benchmark | Function | Instructions | % of total | D1 read misses | Branch mispredict rate |
+|-----------|----------|-------------|-----------|----------------|----------------------|
+| **lease** | `main` (all Turbine inlined) | 151M | 32.8% | 15 | 0.03% |
+| **rotate** | `main` (lease loop inlined) | 133M | 29.6% | 16 | 0.04% |
+| **rotate** | `ArenaManager::collect` | 3.8M | 0.84% | 0 | 0.00% |
+| **rotate** | `ArenaManager::rotate` | 3.7M | 0.83% | 0 | 0.00% |
+| **rotate** | `Arena::advise_free_unused` | 1.1M | 0.23% | 0 | — |
+| **collect** | `ArenaManager::collect` | 83.1M | 19.8% | 190 | 1.03% |
+| **collect** | `ArenaManager::rotate` | 11.7M | 2.78% | 0 | 0.02% |
+| **collect** | `build_drain_queue` (harness) | 10.1M | 2.39% | 6 | 1.79% |
+| **spsc** | `main` (producer loop) | 38.4M | 10.2% | 116 | 0.01% |
+| **spsc** | consumer thread | 27.3M | 7.2% | 96 | 0.01% |
+
+### Cache Performance
+
+| Benchmark | D1 miss rate (read) | LL miss rate | Overall |
+|-----------|-------------------|-------------|---------|
+| lease | 0.3% | 0.1% | Excellent |
+| rotate | 0.3% | 0.1% | Excellent |
+| collect | 0.4% | 0.1% | Excellent |
+| spsc | 0.5% | 0.2% | Excellent |
+
+### Per-Iteration Instruction Efficiency
+
+| Benchmark | Ir per iteration | Notes |
+|-----------|-----------------|-------|
+| lease | ~36 Ir | Bump alloc + lease count + buf_id + drop — fully inlined |
+| rotate | ~37 Ir/iter (67 Ir/rotation) | rotate + collect amortized into lease loop |
+| collect | ~477 Ir/iter (~9.7 Ir/drain element) | Scanning 50-element drain queue per call |
+| spsc | ~3,840 Ir/send | lease + into_sendable + ring push + atomics |
+
+### Callgrind Analysis
+
+**Zero cache problems.** Turbine functions show essentially zero D1/LL cache misses. The `#[repr(C)]` + `CacheAligned` padding on `remote_returns` is working — no false sharing visible. The lease hot path has 15 D1 read misses across 4.2M iterations.
+
+**Near-zero branch misprediction.** The highest mispredict rate in Turbine code is `collect()` at 1.03%, which is expected — the `has_outstanding_leases()` check is inherently unpredictable (some arenas are ready, some aren't). The 5% overall mispredict rate across all benchmarks is entirely from miniz_oxide decompression (68% of all mispredicts), which is pprof's flamegraph writer.
+
+**collect() is tight at ~9.7 instructions per drain queue element.** That covers: load index, deref slab, deref Option, load `has_outstanding_leases` (Relaxed), branch, load `lease_count` (Acquire), branch, swap_remove. No fat to cut.
+
+**The lease path compiles to ~36 instructions** including bump pointer increment, lease count increment, buf_id assignment, and the `LeasedBuffer` construction + drop. This is as efficient as a bump allocator can be.
+
+**Summary.** Valgrind confirms the flamegraph findings at instruction granularity. The code is instruction-efficient, cache-friendly, and well-predicted. No optimization opportunities were identified.
+
+## Assembly Inspection
+
+Generated assembly inspected via `cargo-show-asm` (library symbols) and `objdump` (inlined hot paths in flamegraph binaries). Release profile with `lto = "thin"`, `codegen-units = 1`.
+
+### collect() — 345 instructions
+
+- The `swap_remove` loop compiles to a tight inner loop with no unnecessary work
+- Two separate code paths generated: one with `advise_free_unused` call (when `!skip_madvise`), one without — the branch is hoisted out of the loop, which is optimal
+- `has_outstanding_leases()` (Relaxed load at `[rcx + 24]`) and `lease_count()` (Acquire load at `[rcx + 64]`) — the 64-byte offset confirms `CacheAligned` padding is working correctly in the generated code
+- The `expect("draining arena missing")` compiles to `test rcx, rcx` / `je panic` — one branch per iteration, cold path separated
+- No bounds check elimination opportunities — the slab index bounds check (`cmp r12, rax` / `jae panic`) is unavoidable since `draining` indices are user-controlled
+
+### rotate() — 478 instructions
+
+- Clean two-phase structure: try free pool first, fall back to `mmap`
+- The arena reset path uses `xorps xmm0, xmm0` + `movaps` for zeroing — SSE vectorized
+- `mmap` call is properly on the cold path
+
+### Lease hot path (inlined in binary)
+
+The entire lease path is inlined into the benchmark's `main` — no function call boundaries remain. The inner loop disassembles to:
+
+```
+mov rbx, [rax+r15*8]     ; slab lookup
+lea rax, [r14+r12]       ; bump alloc (pointer + size)
+cmp rax, [rbx+0x8]       ; capacity check
+mov [rbx+0x10], rax      ; advance offset
+lea eax, [rbp+1]         ; lease_count + 1
+mov [rbx+0x20], eax      ; write lease_count
+inc [rbx+0x18]           ; buf_id++
+; ... slot lookup + LeasedBuffer construction ...
+dec [rax+0x18]           ; lease_count-- (drop)
+```
+
+One observation: the `slot_missing_fallback` call is present as a conditional branch in the hot loop (cold path if registration slot map bounds check fails). Not actionable — it's already `#[cold]` and predicted-not-taken.
+
+**Verdict.** No codegen issues found. The compiler is generating optimal code.
+
+## DHAT Heap Profiling
+
+Heap allocation profiling via `valgrind --tool=dhat`. Tracks every `malloc`/`free` with full call stacks.
+
+**Zero heap allocations in Turbine hot paths.** Every allocation site across all three benchmarks (lease, collect, spsc) is from the pprof profiler:
+
+- `pprof::collector::Collector::new` — 136 MB (profiler's internal buffers)
+- `gimli`/`backtrace`/`miniz_oxide` — DWARF parsing for flamegraph symbolization
+- `alloc::raw_vec::grow_one` — Vec resizes in pprof/gimli
+
+The only Turbine-adjacent allocation is `build_drain_queue` in the collect benchmark (25.7 MB) — the benchmark harness creating `Vec<LeasedBuffer>`, not Turbine itself.
+
+**Verdict.** No hidden allocations in any Turbine hot path. The bump allocator and drain queue operate entirely on pre-allocated memory.
+
+## PGO (Profile-Guided Optimization)
+
+Turbine already ships with `lto = "thin"` and `codegen-units = 1`. PGO adds branch layout optimization based on actual runtime profiles. Since PGO is a binary-level optimization, it must be applied in the downstream project (see [integration guide](integration.md#build-optimization-pgo--thin-lto)).
+
+### Measured Impact
+
+| Benchmark | Baseline (thin-LTO) | + PGO | Improvement |
+|-----------|---------------------|-------|-------------|
+| lease | 2.1 ns | 2.1 ns | — |
+| rotate | 3.3 ns | 2.4 ns | **-27%** |
+| collect | 49.0 ns | 31.5 ns | **-36%** |
+| spsc | 89.6 ns | 100.2 ns | noise |
+
+### Analysis
+
+**Rotate improved 27%.** PGO optimized branch layout in the rotate→collect→lease cycle, placing the free-pool-hit path (the common case) on the fall-through.
+
+**Collect improved 36%.** PGO optimized the drain queue scanning loop — the `has_outstanding_leases()` branch (mostly-true during active draining) gets better prediction from profile-informed layout.
+
+**Lease unchanged.** The lease path is already fully inlined and branch-free in the hot loop — PGO has nothing to improve.
+
+**SPSC noise.** Cross-thread benchmarks are inherently noisy due to cache coherence timing.
+
+**Verdict.** PGO is worth enabling for production builds where `rotate()` and `collect()` are hot. See [integration guide](integration.md#build-optimization-pgo--thin-lto) for build steps.

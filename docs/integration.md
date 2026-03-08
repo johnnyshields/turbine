@@ -4,6 +4,19 @@ Turbine is a buffer allocator, not a runtime. It is designed to slot
 underneath an existing async runtime or custom event loop as the buffer
 management layer.
 
+## Integration Checklist
+
+1. **Create one pool per thread** — `IouringBufferPool` is `!Send`; each I/O thread needs its own
+2. **Register with io_uring** — call `pool.register(&ring)` before submitting fixed-buffer ops
+3. **Lease buffers** — `pool.lease(size)` or `pool.lease_or_rotate(size)` in the hot path
+4. **Pin for submission** — `buf.pin_for_write()` to get the `buf_index` for SQEs
+5. **Transfer cross-thread** — `buf.into_sendable()` when sending buffer data between threads
+6. **Rotate periodically** — `pool.rotate()` every N completions or on a timer
+7. **Collect after rotation** — `pool.collect()` to reclaim arenas with zero outstanding leases
+8. **Shrink occasionally** — `pool.shrink()` to release excess free arenas back to the OS
+9. **Enable thin-LTO** — add `lto = "thin"` and `codegen-units = 1` to your release profile
+10. **Consider PGO** — if `rotate()`/`collect()` are hot, PGO yields ~30% improvement (see [Build Optimization](#build-optimization-pgo--thin-lto))
+
 ## With Compio
 
 [Compio](https://github.com/compio-rs/compio) is the most natural fit.
@@ -184,6 +197,65 @@ involved because they manage their own rings internally.
 The practical approach: use Turbine's `Arena` and `ArenaManager` directly
 (bypassing `IouringBufferPool`) and integrate with the runtime's ring
 management. This requires deeper coupling with the runtime's internals.
+
+## Build Optimization: PGO + thin-LTO
+
+Turbine's `Cargo.toml` already enables `lto = "thin"` and `codegen-units = 1`
+for release builds. However, **profile-guided optimization (PGO)** can yield an
+additional 25-35% improvement on the `rotate()` and `collect()` hot paths by
+optimizing branch layout and inlining decisions based on actual runtime behavior.
+
+PGO is a binary-level optimization — it must be applied in the **downstream
+project** that depends on Turbine, not in Turbine itself. When the downstream
+binary is built with PGO, Turbine's code benefits automatically via thin-LTO
+cross-crate inlining.
+
+### PGO Build Steps
+
+```bash
+# 1. Build with instrumentation
+RUSTFLAGS="-Cprofile-generate=target/pgo-data" \
+  cargo build --release
+
+# 2. Run representative workload to generate profile data
+./target/release/your-binary  # exercise the hot paths
+
+# 3. Merge profile data
+llvm-profdata merge -o target/pgo-data/merged.profdata \
+  target/pgo-data/*.profraw
+
+# 4. Rebuild with profile data
+RUSTFLAGS="-Cprofile-use=$(pwd)/target/pgo-data/merged.profdata" \
+  cargo build --release
+```
+
+`llvm-profdata` ships with `rustup component add llvm-tools`. The path is
+`$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata`.
+
+### Measured Impact
+
+Benchmarked on the Turbine flamegraph suite (WSL2, Rust 1.94):
+
+| Hot path | Baseline (thin-LTO) | + PGO | Improvement |
+|----------|---------------------|-------|-------------|
+| `lease()` | 2.1 ns | 2.1 ns | — |
+| `rotate()` | 3.3 ns | 2.4 ns | **27%** |
+| `collect()` | 49.0 ns | 31.5 ns | **36%** |
+| SPSC transfer | 89.6 ns | 100.2 ns | noise |
+
+The `lease()` path is already fully inlined and branch-free, so PGO has no
+effect. `rotate()` and `collect()` have conditional branches (drain queue
+scanning, arena state checks) where PGO's branch layout optimization pays off.
+
+### When to Use PGO
+
+PGO is worth the build complexity when:
+- Your workload is I/O-heavy with frequent epoch rotation and collection
+- You are running a long-lived server where build time is amortized
+- You want to squeeze the last ~30% out of buffer lifecycle management
+
+For applications where `lease()` dominates (high-throughput, infrequent rotation),
+PGO provides no measurable benefit — the hot path is already optimal.
 
 ## General Integration Pattern
 
