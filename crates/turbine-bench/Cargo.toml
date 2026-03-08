@@ -15,6 +15,7 @@ crossbeam-channel = "0.5"
 bumpalo = "3"
 bytes = "1"
 
+io-uring = "0.7"
 pprof = { version = "0.15", features = ["flamegraph"] }
 
 [dev-dependencies]
@@ -31,6 +32,12 @@ name = "flamegraph_cross_thread"
 
 [[bin]]
 name = "flamegraph_collect"
+
+[[bin]]
+name = "flamegraph_spsc"
+
+[[bin]]
+name = "flamegraph_iouring"
 
 [[bench]]
 name = "lease_throughput"
