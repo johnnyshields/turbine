@@ -8,6 +8,7 @@ Epoch-based buffer rotation for io_uring. Linux only, MIT licensed.
 crates/
   turbine-core/   # Core library: arenas, epochs, io_uring registration, cross-thread transfer
   turbine/        # Facade crate re-exporting the public API
+docs/             # User guide, integration guide, architecture, benchmarks, contributing
 lore/             # Implementation notes and research documents
 ```
 

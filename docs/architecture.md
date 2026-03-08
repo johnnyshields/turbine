@@ -89,7 +89,7 @@ lifecycle through three collections:
 This ensures `rotate()` never blocks on outstanding leases and never leaves
 the pool without a writable arena.
 
-**Collection (`collect()`):** Iterates the drain queue with `retain()`. Arenas
+**Collection (`collect()`):** Iterates the drain queue with `swap_remove`. Arenas
 with `lease_count() == 0` move to the free pool. The split counter means this
 check transparently accounts for both local and cross-thread releases.
 
