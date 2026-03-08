@@ -77,7 +77,7 @@ impl Arena {
     ///
     /// Returns `(pointer, buf_id)` or `None` if the arena is full.
     /// The pointer is valid for the lifetime of the arena.
-    #[inline]
+    #[inline(always)]
     pub fn alloc(&self, len: usize) -> Option<(*mut u8, u32)> {
         let current = self.offset.get();
         let new_offset = current + len;
@@ -96,13 +96,13 @@ impl Arena {
     }
 
     /// Increment the lease count.
-    #[inline]
+    #[inline(always)]
     pub fn acquire_lease(&self) {
         self.lease_count.set(self.lease_count.get() + 1);
     }
 
     /// Decrement the lease count.
-    #[inline]
+    #[inline(always)]
     pub fn release_lease(&self) {
         let count = self.lease_count.get();
         debug_assert!(count > 0, "release_lease called with zero lease count");

@@ -34,13 +34,15 @@ pub trait EpochObserver {
 pub struct NoopHooks;
 
 impl BufferPinHook for NoopHooks {
-    #[inline]
+    #[inline(always)]
     fn on_pin(&self, _epoch: u64, _buf_id: u32) {}
 }
 
 impl EpochObserver for NoopHooks {
-    #[inline]
+    #[inline(always)]
     fn on_rotate(&self, _retired: u64, _active: u64) {}
-    #[inline]
+    #[inline(always)]
     fn on_collect(&self, _epoch: u64) {}
+    #[inline(always)]
+    fn on_collect_sweep(&self, _collected: usize) {}
 }

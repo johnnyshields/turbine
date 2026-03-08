@@ -8,7 +8,7 @@ use crate::epoch::manager::ArenaManager;
 use crate::error::{Result, TurbineError};
 use crate::gc::{BufferPinHook, EpochObserver};
 use crate::ring::registration::RingRegistration;
-use crate::SlotId;
+use crate::{ArenaIdx, SlotId};
 
 /// The main API for epoch-based io_uring buffer management.
 ///
@@ -27,7 +27,7 @@ pub struct IouringBufferPool<H> {
 }
 
 impl<H> IouringBufferPool<H> {
-    #[inline]
+    #[inline(always)]
     fn mgr(&self) -> &ArenaManager {
         unsafe { &*self.manager.get() }
     }
@@ -41,7 +41,7 @@ impl<H> IouringBufferPool<H> {
         unsafe { &mut *self.manager.get() }
     }
 
-    #[inline]
+    #[inline(always)]
     fn reg(&self) -> &RingRegistration {
         unsafe { &*self.registration.get() }
     }
@@ -72,27 +72,18 @@ impl<H: BufferPinHook + EpochObserver> IouringBufferPool<H> {
     ///
     /// Returns `None` if the arena is full. The returned [`LeasedBuffer`] is
     /// `!Send` and must not leave the owning thread.
-    #[inline]
+    #[inline(always)]
     pub fn lease(&self, len: usize) -> Option<LeasedBuffer> {
         let mgr = self.mgr();
-        let arena = mgr.current_arena();
+        let (arena, arena_idx) = mgr.current_arena_with_idx();
         let (ptr, buf_id) = arena.alloc(len)?;
         arena.acquire_lease();
 
         self.hooks.on_pin(arena.epoch(), buf_id);
 
-        let arena_idx = mgr.current_arena_idx();
         let slot_id = match self.reg().slot_for_arena(arena_idx) {
             Some(id) => id,
-            None => {
-                if self.reg().is_registered() {
-                    tracing::warn!(
-                        arena_idx = arena_idx.as_usize(),
-                        "arena has no registration slot despite pool being registered"
-                    );
-                }
-                SlotId::new(0)
-            }
+            None => Self::slot_missing_fallback(self.reg(), arena_idx),
         };
         // SAFETY: ptr points into the arena's mmap region which is valid
         // for the arena's lifetime. The arena outlives the lease because
@@ -101,6 +92,19 @@ impl<H: BufferPinHook + EpochObserver> IouringBufferPool<H> {
             LeasedBuffer::new(ptr, len, arena.epoch(), buf_id, slot_id, arena, arena_idx)
         };
         Some(buf)
+    }
+
+    /// Cold path for when slot lookup returns None.
+    #[cold]
+    #[inline(never)]
+    fn slot_missing_fallback(reg: &RingRegistration, arena_idx: ArenaIdx) -> SlotId {
+        if reg.is_registered() {
+            tracing::warn!(
+                arena_idx = arena_idx.as_usize(),
+                "arena has no registration slot despite pool being registered"
+            );
+        }
+        SlotId::new(0)
     }
 
     /// Lease `len` bytes, auto-rotating if the current arena is full.

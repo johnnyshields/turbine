@@ -156,17 +156,43 @@ impl ArenaManager {
     }
 
     /// Reference to the current writable arena.
-    #[inline]
+    ///
+    /// # Safety justification
+    /// `write_idx` always points to a valid, `Some` slab entry. This invariant
+    /// is maintained by `new()` (sets `write_idx` to the first arena) and
+    /// `rotate()` (secures the next arena before updating `write_idx`).
+    #[inline(always)]
     pub fn current_arena(&self) -> &Arena {
-        self.arenas[self.write_idx.as_usize()]
-            .as_ref()
-            .expect("write arena missing")
+        // SAFETY: write_idx is always a valid index into a Some slot.
+        // See safety justification above.
+        unsafe {
+            self.arenas
+                .get_unchecked(self.write_idx.as_usize())
+                .as_ref()
+                .unwrap_unchecked()
+        }
     }
 
     /// Slab index of the current writable arena.
-    #[inline]
+    #[inline(always)]
     pub fn current_arena_idx(&self) -> ArenaIdx {
         self.write_idx
+    }
+
+    /// Reference to the current writable arena and its slab index in one call.
+    ///
+    /// Avoids the overhead of calling `current_arena()` and
+    /// `current_arena_idx()` separately in the hot lease path.
+    #[inline(always)]
+    pub fn current_arena_with_idx(&self) -> (&Arena, ArenaIdx) {
+        // SAFETY: same invariant as current_arena().
+        let arena = unsafe {
+            self.arenas
+                .get_unchecked(self.write_idx.as_usize())
+                .as_ref()
+                .unwrap_unchecked()
+        };
+        (arena, self.write_idx)
     }
 
     /// Look up an arena by slab index.
