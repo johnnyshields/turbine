@@ -260,3 +260,35 @@ PGO adds branch layout optimization based on actual runtime profiles. See the
 
 **Verdict.** PGO is worth enabling for production builds where `rotate()` and
 `collect()` are hot.
+
+## Test Coverage
+
+Measured via `cargo llvm-cov` (LLVM source-based coverage). Only the library crate (`turbine-core`) is tracked — flamegraph binaries in `turbine-bench` are excluded.
+
+```bash
+# Run coverage
+cargo llvm-cov -p turbine-core --summary-only
+
+# Detailed per-line report
+cargo llvm-cov -p turbine-core --text
+```
+
+### Results
+
+| File | Lines | Cover |
+|------|-------|-------|
+| `buffer/leased.rs` | 154 | 100% |
+| `buffer/pinned.rs` | 43 | 100% |
+| `buffer/pool.rs` | 339 | 98.2% |
+| `config.rs` | 113 | 100% |
+| `epoch/arena.rs` | 337 | 96.7% |
+| `epoch/manager.rs` | 528 | 99.6% |
+| `error.rs` | 67 | 100% |
+| `gc.rs` | 55 | 96.4% |
+| `ring/registration.rs` | 315 | 98.7% |
+| `transfer/handle.rs` | 90 | 98.9% |
+| `types.rs` | 92 | 100% |
+
+The ~26 uncovered lines are all in untestable error/tracing paths: `mmap` failure returns, `munmap` failure in `Drop`, `tracing::warn`/`tracing::error` calls, and compile-time assertion functions that are never called at runtime.
+
+io_uring `register()`/`unregister()` tests require a real io_uring ring. They skip gracefully when io_uring is unavailable (e.g., in CI containers or non-Linux).

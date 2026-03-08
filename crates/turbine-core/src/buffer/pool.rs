@@ -448,6 +448,125 @@ mod tests {
         drop(buf);
     }
 
+    #[test]
+    fn lease_or_rotate_error_when_too_large() {
+        let config = PoolConfig {
+            arena_size: 4096,
+            initial_arenas: 2,
+            max_free_arenas: 4,
+            max_total_arenas: 0,
+            registration_slots: 32,
+            page_size: 4096,
+        };
+        let pool = IouringBufferPool::new(config, NoopHooks).unwrap();
+
+        // Request more than arena capacity — lease fails, rotate succeeds,
+        // but second lease also fails → ArenaFull error.
+        let result = pool.lease_or_rotate(5000);
+        let err = result.err().expect("should fail for oversized request");
+        assert!(matches!(err, TurbineError::ArenaFull { requested: 5000, .. }));
+    }
+
+    #[test]
+    fn collect_epoch_not_found() {
+        let pool = test_pool();
+        let err = pool.collect_epoch(999).unwrap_err();
+        assert!(matches!(err, TurbineError::EpochNotFound(999)));
+    }
+
+    #[test]
+    fn collect_epoch_not_collectable() {
+        let pool = test_pool();
+        let _buf = pool.lease(64).unwrap();
+        // Epoch 0 has an outstanding lease — can't collect.
+        let err = pool.collect_epoch(0).unwrap_err();
+        assert!(matches!(err, TurbineError::EpochNotCollectable(0, 1)));
+    }
+
+    #[test]
+    fn epoch_and_available_accessors() {
+        let pool = test_pool();
+        assert_eq!(pool.epoch(), 0);
+        assert_eq!(pool.available(), 4096);
+        assert_eq!(pool.draining_count(), 0);
+    }
+
+    #[test]
+    fn rotate_triggers_new_arena_allocation() {
+        let config = PoolConfig {
+            arena_size: 4096,
+            initial_arenas: 1,
+            max_free_arenas: 4,
+            max_total_arenas: 0,
+            registration_slots: 32,
+            page_size: 4096,
+        };
+        let pool = IouringBufferPool::new(config, NoopHooks).unwrap();
+        pool.pre_register_slots();
+
+        // Hold a lease on the only arena so auto-collect can't recycle it
+        let _buf = pool.lease(64).unwrap();
+
+        // Rotate must allocate a new arena (free pool empty, can't collect)
+        pool.rotate().unwrap();
+        assert_eq!(pool.epoch(), 1);
+    }
+
+    #[test]
+    fn lease_or_rotate_success_after_full() {
+        let pool = test_pool();
+        pool.pre_register_slots();
+
+        // Fill the current arena
+        let _buf = pool.lease(4096).unwrap();
+
+        // lease_or_rotate should rotate and then successfully lease
+        let buf2 = pool.lease_or_rotate(64).unwrap();
+        assert_eq!(buf2.epoch(), 1);
+    }
+
+    #[test]
+    fn lease_or_rotate_fast_path() {
+        let pool = test_pool();
+        pool.pre_register_slots();
+
+        // Arena has plenty of space — should take the fast Ok path (line 117)
+        let buf = pool.lease_or_rotate(64).unwrap();
+        assert_eq!(buf.epoch(), 0);
+        assert_eq!(pool.epoch(), 0); // no rotation occurred
+    }
+
+    #[test]
+    fn register_and_unregister_with_io_uring() {
+        let ring = match io_uring::IoUring::new(8) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        let pool = test_pool();
+
+        pool.register(&ring).unwrap();
+        pool.unregister(&ring).unwrap();
+    }
+
+    #[test]
+    fn slot_missing_fallback_returns_zero() {
+        // Create a pool without pre-registering slots, so lease takes fallback path
+        let config = PoolConfig {
+            arena_size: 4096,
+            initial_arenas: 1,
+            max_free_arenas: 4,
+            max_total_arenas: 0,
+            registration_slots: 32,
+            page_size: 4096,
+        };
+        let pool = IouringBufferPool::new(config, NoopHooks).unwrap();
+        // Don't call pre_register_slots, so slot_for_arena returns None
+        // The lease should still succeed, using slot 0 as fallback
+        let buf = pool.lease(64).unwrap();
+        assert_eq!(buf.slot_id(), SlotId::new(0));
+    }
+
     /// Compile-time assertion that IouringBufferPool is !Send.
     /// Enforced via `PhantomData<Rc<()>>` in the pool struct.
     /// If this fails to compile, it means the pool incorrectly implements Send.

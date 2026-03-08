@@ -466,6 +466,121 @@ mod tests {
     }
 
     #[test]
+    fn capacity_returns_size() {
+        let arena = Arena::new(8192).unwrap();
+        assert_eq!(arena.capacity(), 8192);
+    }
+
+    #[test]
+    fn state_transitions() {
+        let arena = Arena::new(4096).unwrap();
+        assert_eq!(arena.state(), ArenaState::Collected); // default from new()
+
+        arena.set_state(ArenaState::Writable);
+        assert_eq!(arena.state(), ArenaState::Writable);
+
+        arena.set_state(ArenaState::Retired);
+        assert_eq!(arena.state(), ArenaState::Retired);
+
+        arena.set_state(ArenaState::Collected);
+        assert_eq!(arena.state(), ArenaState::Collected);
+    }
+
+    #[test]
+    fn epoch_get_set() {
+        let arena = Arena::new(4096).unwrap();
+        assert_eq!(arena.epoch(), 0);
+
+        arena.set_epoch(42);
+        assert_eq!(arena.epoch(), 42);
+
+        arena.set_epoch(u64::MAX);
+        assert_eq!(arena.epoch(), u64::MAX);
+    }
+
+    #[test]
+    fn base_ptr_is_non_null() {
+        let arena = Arena::new(4096).unwrap();
+        assert!(!arena.base_ptr().is_null());
+    }
+
+    #[test]
+    fn used_tracks_allocations() {
+        let arena = Arena::new(4096).unwrap();
+        arena.set_state(ArenaState::Writable);
+        assert_eq!(arena.used(), 0);
+
+        arena.alloc(100).unwrap();
+        assert_eq!(arena.used(), 100);
+
+        arena.alloc(200).unwrap();
+        assert_eq!(arena.used(), 300);
+    }
+
+    #[test]
+    fn advise_free_unused_no_op_when_full() {
+        let arena = Arena::new(4096).unwrap();
+        arena.set_state(ArenaState::Writable);
+        arena.alloc(4096).unwrap();
+        // start would be aligned up from 4096 = 4096, which equals capacity → no madvise
+        arena.advise_free_unused(4096);
+    }
+
+    #[test]
+    fn advise_free_unused_with_partial_use() {
+        let arena = Arena::new(4096).unwrap();
+        arena.set_state(ArenaState::Writable);
+        arena.alloc(100).unwrap();
+        // Should madvise the unused portion — should not panic
+        arena.advise_free_unused(4096);
+    }
+
+    #[test]
+    fn arena_state_debug() {
+        assert_eq!(format!("{:?}", ArenaState::Writable), "Writable");
+        assert_eq!(format!("{:?}", ArenaState::Retired), "Retired");
+        assert_eq!(format!("{:?}", ArenaState::Collected), "Collected");
+    }
+
+    #[test]
+    fn arena_state_clone_eq() {
+        let s = ArenaState::Writable;
+        let s2 = s.clone();
+        assert_eq!(s, s2);
+        assert_ne!(ArenaState::Writable, ArenaState::Retired);
+    }
+
+    #[test]
+    fn remote_returns_ptr_is_stable() {
+        let arena = Arena::new(4096).unwrap();
+        let p1 = arena.remote_returns_ptr();
+        let p2 = arena.remote_returns_ptr();
+        assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn alloc_zero_bytes() {
+        let arena = Arena::new(4096).unwrap();
+        arena.set_state(ArenaState::Writable);
+        let (ptr, id) = arena.alloc(0).unwrap();
+        assert!(!ptr.is_null());
+        assert_eq!(id, 0);
+        assert_eq!(arena.used(), 0);
+        assert_eq!(arena.available(), 4096);
+    }
+
+    #[test]
+    fn buf_id_wraps() {
+        let arena = Arena::new(4096).unwrap();
+        arena.set_state(ArenaState::Writable);
+        // Allocate many zero-size buffers to check buf_id increments
+        for expected in 0..10u32 {
+            let (_, id) = arena.alloc(0).unwrap();
+            assert_eq!(id, expected);
+        }
+    }
+
+    #[test]
     fn allocations_are_contiguous() {
         let arena = Arena::new(4096).unwrap();
         arena.set_state(ArenaState::Writable);

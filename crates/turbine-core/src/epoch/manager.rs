@@ -640,6 +640,113 @@ mod tests {
         assert_eq!(mgr.draining_count(), 0);
     }
 
+    #[test]
+    fn arena_at_returns_none_for_missing() {
+        let mgr = ArenaManager::new(&test_config()).unwrap();
+        // Out of bounds index
+        assert!(mgr.arena_at(ArenaIdx::new(999)).is_none());
+    }
+
+    #[test]
+    fn arena_at_returns_none_after_shrink() {
+        let config = PoolConfig {
+            arena_size: 4096,
+            initial_arenas: 3,
+            max_free_arenas: 0,
+            max_total_arenas: 0,
+            registration_slots: 32,
+            page_size: 4096,
+        };
+        let mut mgr = ArenaManager::new(&config).unwrap();
+
+        // Rotate to retire arena 0, then collect and shrink to remove it.
+        mgr.rotate().unwrap();
+        mgr.rotate().unwrap();
+        mgr.collect();
+        mgr.shrink();
+
+        // At least one slab slot should now be None
+        let has_none = (0..3).any(|i| mgr.arena_at(ArenaIdx::new(i)).is_none());
+        assert!(has_none, "shrink should have removed at least one arena");
+    }
+
+    #[test]
+    fn alloc_arena_reuses_none_slots() {
+        let config = PoolConfig {
+            arena_size: 4096,
+            initial_arenas: 3,
+            max_free_arenas: 0,
+            max_total_arenas: 0,
+            registration_slots: 32,
+            page_size: 4096,
+        };
+        let mut mgr = ArenaManager::new(&config).unwrap();
+
+        // Rotate twice, collect, shrink → creates None slots in slab
+        mgr.rotate().unwrap();
+        mgr.rotate().unwrap();
+        mgr.collect();
+        let removed = mgr.shrink();
+        assert!(removed > 0);
+
+        let slab_len_before = mgr.live_arenas().count();
+
+        // Hold a lease so next rotate needs a new alloc
+        mgr.current_arena().acquire_lease();
+        mgr.rotate().unwrap();
+
+        // The new arena should have reused a None slot, not grown the slab
+        let slab_len_after = mgr.live_arenas().count();
+        assert_eq!(slab_len_after, slab_len_before + 1);
+
+        // Clean up
+        for (_, a) in mgr.live_arenas() {
+            while a.lease_count() > 0 {
+                a.release_lease();
+            }
+        }
+    }
+
+    #[test]
+    fn live_arenas_iterator() {
+        let mgr = ArenaManager::new(&test_config()).unwrap();
+        let live: Vec<_> = mgr.live_arenas().collect();
+        assert_eq!(live.len(), 3); // initial_arenas = 3
+        // Indices should be 0, 1, 2
+        assert_eq!(live[0].0, ArenaIdx::new(0));
+        assert_eq!(live[1].0, ArenaIdx::new(1));
+        assert_eq!(live[2].0, ArenaIdx::new(2));
+    }
+
+    #[test]
+    fn current_arena_with_idx() {
+        let mgr = ArenaManager::new(&test_config()).unwrap();
+        let (arena, idx) = mgr.current_arena_with_idx();
+        assert_eq!(idx, ArenaIdx::new(0));
+        assert_eq!(arena.state(), ArenaState::Writable);
+    }
+
+    #[test]
+    fn rotate_auto_collects_before_alloc() {
+        // With initial_arenas=2, free_pool starts with 1. After one rotate
+        // (no leases), the next rotate should auto-collect the retired arena
+        // instead of allocating new.
+        let config = PoolConfig {
+            arena_size: 4096,
+            initial_arenas: 2,
+            max_free_arenas: 4,
+            max_total_arenas: 0,
+            registration_slots: 32,
+            page_size: 4096,
+        };
+        let mut mgr = ArenaManager::new(&config).unwrap();
+
+        mgr.rotate().unwrap(); // uses free pool (1 → 0)
+        // No leases on retired arena, so next rotate should auto-collect it
+        let result = mgr.rotate().unwrap();
+        assert_eq!(result.new_arena_idx, None, "should have reused via auto-collect");
+    }
+
     /// Helper: assert the unsafe invariant that `arenas[write_idx]` is `Some`.
     fn assert_write_idx_valid(mgr: &ArenaManager) {
         let idx = mgr.write_idx.as_usize();

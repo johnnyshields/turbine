@@ -104,6 +104,54 @@ mod tests {
     }
 
     #[test]
+    fn sendable_buffer_len_and_epoch() {
+        let arena = Arena::new(4096).unwrap();
+        arena.set_state(ArenaState::Writable);
+        arena.set_epoch(42);
+
+        let (ptr, _) = arena.alloc(128).unwrap();
+        arena.acquire_lease();
+
+        let buf = SendableBuffer::new(ptr, 128, 42, arena.remote_returns_ptr());
+        assert_eq!(buf.len(), 128);
+        assert!(!buf.is_empty());
+        assert_eq!(buf.epoch(), 42);
+    }
+
+    #[test]
+    fn sendable_buffer_empty() {
+        let arena = Arena::new(4096).unwrap();
+        arena.set_state(ArenaState::Writable);
+        arena.set_epoch(1);
+
+        let (ptr, _) = arena.alloc(0).unwrap();
+        arena.acquire_lease();
+
+        let buf = SendableBuffer::new(ptr, 0, 1, arena.remote_returns_ptr());
+        assert_eq!(buf.len(), 0);
+        assert!(buf.is_empty());
+        assert_eq!(buf.epoch(), 1);
+    }
+
+    #[test]
+    fn sendable_buffer_as_slice() {
+        let arena = Arena::new(4096).unwrap();
+        arena.set_state(ArenaState::Writable);
+        arena.set_epoch(1);
+
+        let (ptr, _) = arena.alloc(16).unwrap();
+        arena.acquire_lease();
+
+        // Write recognizable data
+        unsafe { std::ptr::write_bytes(ptr, 0xFE, 16) };
+
+        let buf = SendableBuffer::new(ptr, 16, 1, arena.remote_returns_ptr());
+        let slice = unsafe { buf.as_slice() };
+        assert_eq!(slice.len(), 16);
+        assert!(slice.iter().all(|&b| b == 0xFE));
+    }
+
+    #[test]
     fn multiple_sendable_buffers_decrement() {
         let arena = Arena::new(4096).unwrap();
         arena.set_state(ArenaState::Writable);

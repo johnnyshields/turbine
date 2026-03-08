@@ -335,6 +335,63 @@ mod tests {
     }
 
     #[test]
+    fn slot_allocator_capacity_accessor() {
+        let alloc = SlotAllocator::new(16);
+        assert_eq!(alloc.capacity(), 16);
+    }
+
+    #[test]
+    fn unregister_arena_nonexistent_is_noop() {
+        let mut reg = RingRegistration::new(8);
+        let gen_before = reg.generation();
+        // Unregister an arena that was never registered — should be a no-op.
+        reg.unregister_arena(ArenaIdx::new(42));
+        assert_eq!(reg.generation(), gen_before);
+    }
+
+    #[test]
+    fn unregister_arena_within_map_but_none() {
+        let mut reg = RingRegistration::new(8);
+        // Register arena 0, then unregister it, then try again — should be no-op.
+        reg.register_arena(ArenaIdx::new(0)).unwrap();
+        let gen_after_reg = reg.generation();
+        reg.unregister_arena(ArenaIdx::new(0));
+        assert!(reg.generation() > gen_after_reg);
+
+        // Now slot 0 in the map is None — unregistering again is a no-op.
+        let gen_before = reg.generation();
+        reg.unregister_arena(ArenaIdx::new(0));
+        assert_eq!(reg.generation(), gen_before);
+    }
+
+    #[test]
+    fn register_arena_exhausts_slots() {
+        let mut reg = RingRegistration::new(2);
+        reg.register_arena(ArenaIdx::new(0)).unwrap();
+        reg.register_arena(ArenaIdx::new(1)).unwrap();
+        let err = reg.register_arena(ArenaIdx::new(2)).unwrap_err();
+        assert!(matches!(err, TurbineError::NoRegistrationSlot(_)));
+    }
+
+    #[test]
+    fn generation_increments_on_register_and_unregister() {
+        let mut reg = RingRegistration::new(8);
+        assert_eq!(reg.generation(), 0);
+
+        reg.register_arena(ArenaIdx::new(0)).unwrap();
+        assert_eq!(reg.generation(), 1);
+
+        reg.unregister_arena(ArenaIdx::new(0));
+        assert_eq!(reg.generation(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "SlotAllocator supports at most 64 slots")]
+    fn slot_allocator_capacity_65_panics() {
+        SlotAllocator::new(65);
+    }
+
+    #[test]
     fn arena_slot_map_sparse_indices() {
         let mut reg = RingRegistration::new(8);
 
@@ -358,5 +415,66 @@ mod tests {
         assert_eq!(reg.slot_for_arena(ArenaIdx::new(50)), None);
         assert_eq!(reg.slot_for_arena(ArenaIdx::new(0)), Some(s0));
         assert_eq!(reg.slot_for_arena(ArenaIdx::new(99)), Some(s99));
+    }
+
+    #[test]
+    fn register_and_unregister_with_io_uring() {
+        let ring = match io_uring::IoUring::new(8) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        let mut reg = RingRegistration::new(8);
+        let arena0 = Box::new(Arena::new(4096).unwrap());
+        let arena1 = Box::new(Arena::new(4096).unwrap());
+
+        let arenas = vec![
+            (ArenaIdx::new(0), &*arena0),
+            (ArenaIdx::new(1), &*arena1),
+        ];
+
+        reg.register(&ring.submitter(), arenas.into_iter()).unwrap();
+        assert!(reg.is_registered());
+        assert!(reg.generation() > 0);
+        assert!(reg.slot_for_arena(ArenaIdx::new(0)).is_some());
+        assert!(reg.slot_for_arena(ArenaIdx::new(1)).is_some());
+
+        reg.unregister(&ring.submitter()).unwrap();
+        assert!(!reg.is_registered());
+        assert_eq!(reg.slot_for_arena(ArenaIdx::new(0)), None);
+        assert_eq!(reg.slot_for_arena(ArenaIdx::new(1)), None);
+    }
+
+    #[test]
+    fn unregister_when_not_registered_is_noop() {
+        let ring = match io_uring::IoUring::new(8) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        let mut reg = RingRegistration::new(8);
+        reg.unregister(&ring.submitter()).unwrap();
+        assert!(!reg.is_registered());
+    }
+
+    #[test]
+    fn register_unregister_cycle() {
+        let ring = match io_uring::IoUring::new(8) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        let mut reg = RingRegistration::new(4);
+
+        for _ in 0..3 {
+            let arena = Box::new(Arena::new(4096).unwrap());
+            let arenas = vec![(ArenaIdx::new(0), &*arena)];
+
+            reg.register(&ring.submitter(), arenas.into_iter()).unwrap();
+            assert!(reg.is_registered());
+
+            reg.unregister(&ring.submitter()).unwrap();
+            assert!(!reg.is_registered());
+        }
     }
 }

@@ -244,6 +244,20 @@ mod tests {
     }
 
     #[test]
+    fn leased_buffer_arena_idx_and_slot_id() {
+        let arena = Arena::new(4096).unwrap();
+        arena.set_state(ArenaState::Writable);
+        arena.set_epoch(1);
+
+        let (ptr, buf_id) = arena.alloc(32).unwrap();
+        arena.acquire_lease();
+
+        let buf = unsafe { LeasedBuffer::new(ptr, 32, 1, buf_id, SlotId::new(7), &arena as *const Arena, ArenaIdx::new(3)) };
+        assert_eq!(buf.arena_idx(), ArenaIdx::new(3));
+        assert_eq!(buf.slot_id(), SlotId::new(7));
+    }
+
+    #[test]
     fn into_sendable_keeps_lease_alive() {
         let arena = Arena::new(4096).unwrap();
         arena.set_state(ArenaState::Writable);
