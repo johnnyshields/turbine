@@ -15,11 +15,36 @@ pub enum ArenaState {
     Collected,
 }
 
+/// Cache-line aligned wrapper to prevent false sharing between
+/// writer-hot fields and the cross-thread `remote_returns` counter.
+#[repr(C, align(64))]
+struct CacheAligned<T>(T);
+
+impl<T> std::ops::Deref for CacheAligned<T> {
+    type Target = T;
+    #[inline(always)]
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for CacheAligned<T> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
 /// An mmap-backed bump allocator for a single epoch's buffers.
 ///
 /// Allocations are append-only with a single branch + store per allocation.
 /// Lease counting uses `Cell<usize>` — no atomics, because arenas are
 /// thread-local.
+///
+/// Field layout: writer-hot fields are grouped first, followed by
+/// `remote_returns` on its own cache line to prevent false sharing
+/// with cross-thread atomic updates.
+#[repr(C)]
 pub struct Arena {
     /// Base pointer to the mmap region.
     base: NonNull<u8>,
@@ -29,15 +54,19 @@ pub struct Arena {
     offset: Cell<usize>,
     /// Number of outstanding leases (local acquires and releases).
     lease_count: Cell<usize>,
-    /// Number of cross-thread lease releases (atomically incremented by SendableBuffer::drop).
-    remote_returns: AtomicUsize,
     /// Monotonically increasing buffer ID within this arena.
     next_buf_id: Cell<u32>,
     /// Lifecycle state.
     state: Cell<ArenaState>,
     /// The epoch this arena is associated with (set on activation).
     epoch: Cell<u64>,
+    /// Number of cross-thread lease releases (atomically incremented by SendableBuffer::drop).
+    /// Placed last and cache-aligned to avoid false sharing with writer-hot fields above.
+    remote_returns: CacheAligned<AtomicUsize>,
 }
+
+// Compile-time assertion: remote_returns must start at or beyond the first cache line.
+const _: () = assert!(std::mem::offset_of!(Arena, remote_returns) >= 64);
 
 impl Arena {
     /// Create a new arena backed by an anonymous mmap of `size` bytes.
@@ -66,10 +95,10 @@ impl Arena {
             capacity: size,
             offset: Cell::new(0),
             lease_count: Cell::new(0),
-            remote_returns: AtomicUsize::new(0),
             next_buf_id: Cell::new(0),
             state: Cell::new(ArenaState::Collected),
             epoch: Cell::new(0),
+            remote_returns: CacheAligned(AtomicUsize::new(0)),
         })
     }
 
@@ -118,7 +147,7 @@ impl Arena {
     /// Pointer to the remote_returns counter for use by SendableBuffer.
     #[inline]
     pub fn remote_returns_ptr(&self) -> *const AtomicUsize {
-        &self.remote_returns as *const AtomicUsize
+        &self.remote_returns.0 as *const AtomicUsize
     }
 
     /// Fast check: does this arena definitely have outstanding leases?
@@ -232,7 +261,7 @@ impl Drop for Arena {
     #[cold]
     fn drop(&mut self) {
         let local = self.lease_count.get();
-        let remote = *self.remote_returns.get_mut();
+        let remote = *self.remote_returns.0.get_mut();
         let outstanding = local - remote;
         if outstanding > 0 {
             debug_assert_eq!(outstanding, 0, "arena dropped with {} outstanding leases", outstanding);
