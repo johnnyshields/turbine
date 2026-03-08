@@ -6,6 +6,11 @@ use turbine_core::buffer::pool::IouringBufferPool;
 use turbine_core::config::PoolConfig;
 use turbine_core::gc::NoopHooks;
 
+/// Check the wall clock every this many iterations.
+/// At ~2ns/iter this is roughly every ~200µs — frequent enough for a
+/// clean shutdown, rare enough to stay off the flamegraph.
+const CLOCK_CHECK_INTERVAL: u64 = 100_000;
+
 fn main() {
     let config = PoolConfig {
         arena_size: 4096 * 64, // 256 KiB — plenty of room
@@ -27,24 +32,38 @@ fn main() {
         .build()
         .expect("failed to start profiler");
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let duration = Duration::from_secs(5);
+    let start = Instant::now();
     let mut iters = 0u64;
 
-    while Instant::now() < deadline {
-        let buf = match pool.lease(64) {
-            Some(buf) => buf,
-            None => {
-                pool.rotate().unwrap();
-                pool.collect();
-                pool.lease(64).expect("fresh arena should have space")
-            }
-        };
-        black_box(&buf);
-        drop(buf);
-        iters += 1;
+    // Check the clock every CLOCK_CHECK_INTERVAL iterations, not every
+    // iteration. At ~2ns/iter the inner batch is ~200µs — invisible to
+    // the profiler but keeps us bounded to wall-clock time.
+    'outer: loop {
+        for _ in 0..CLOCK_CHECK_INTERVAL {
+            let buf = match pool.lease(64) {
+                Some(buf) => buf,
+                None => {
+                    pool.rotate().unwrap();
+                    pool.collect();
+                    pool.lease(64).expect("fresh arena should have space")
+                }
+            };
+            black_box(&buf);
+            drop(buf);
+        }
+        iters += CLOCK_CHECK_INTERVAL;
+        if start.elapsed() >= duration {
+            break 'outer;
+        }
     }
 
-    eprintln!("Completed {iters} lease/drop iterations in 5s");
+    let elapsed = start.elapsed();
+    eprintln!(
+        "Completed {iters} lease/drop iterations in {:.2}s ({:.1}ns/iter)",
+        elapsed.as_secs_f64(),
+        elapsed.as_nanos() as f64 / iters as f64,
+    );
 
     let report = guard.report().build().unwrap();
     let mut opts = Options::default();
