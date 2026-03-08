@@ -17,7 +17,7 @@ lore/             # Implementation notes and research documents
 - `buffer/pool.rs` — `IouringBufferPool`: main API, owns ArenaManager, UnsafeCell interior mutability
 - `buffer/leased.rs` — `LeasedBuffer`: !Send buffer with arena lease, `SlotId` for io_uring, `into_sendable()` for cross-thread
 - `buffer/pinned.rs` — `PinnedWrite`: borrow guard for io_uring submission, `buf_index()` returns `SlotId`
-- `epoch/manager.rs` — `ArenaManager`: slab-based arena management with drain queue and free pool, auto-collect on rotate
+- `epoch/manager.rs` — `ArenaManager`: slab-based arena management with drain queue and free pool, auto-collect on rotate; private `write_arena()` is the single unsafe accessor for the write-index invariant
 - `epoch/arena.rs` — `Arena`: mmap'd bump allocator, lease counting via `Cell<usize>` + `AtomicUsize` (split counter for cross-thread returns), `advise_free_unused()` for madvise (warns on failure)
 - `transfer/handle.rs` — `SendableBuffer`: cross-thread buffer transfer via atomic lease release
 - `ring/registration.rs` — `RingRegistration`: slot allocator + arena-to-slot mapping for io_uring
@@ -49,7 +49,11 @@ These are load-bearing and must not be weakened:
 
 ## Conventions
 
+- `#![deny(unsafe_op_in_unsafe_fn)]` is enforced crate-wide — all unsafe ops require explicit `unsafe {}` blocks even inside unsafe fns
+- All unsafe access to the write-index slab goes through `ArenaManager::write_arena()` — do not duplicate the `get_unchecked`/`unwrap_unchecked` pattern elsewhere
+- No speculative unsafe functions — if a safe path exists with negligible overhead, prefer it; add unsafe variants only when a profiler proves the need
 - Atomics only for `Arena::remote_returns` (cross-thread lease release); all other arena state uses `Cell` (thread-local assumption)
 - Epoch lifecycle: Writable → Retired → Collected → recycled
 - Tests use `NoopHooks` and `PoolConfig { arena_size: 4096, initial_arenas: 3, ..defaults }`
 - Arena minimum count is 1 (one writable); draining arenas accumulate in drain queue
+- See `lore/conventions.md` for extended conventions

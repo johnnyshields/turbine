@@ -1,3 +1,5 @@
+#![deny(unsafe_op_in_unsafe_fn)]
+
 pub mod buffer;
 pub mod config;
 pub mod epoch;

@@ -154,22 +154,6 @@ impl RingRegistration {
         self.arena_slot_map.get(slab_idx.as_usize()).copied().flatten()
     }
 
-    /// Look up the io_uring slot for a known-valid arena slab index.
-    ///
-    /// # Safety
-    /// `slab_idx` must be in bounds of the arena_slot_map and the entry must be `Some`.
-    #[inline(always)]
-    pub unsafe fn slot_for_arena_unchecked(&self, slab_idx: ArenaIdx) -> SlotId {
-        // SAFETY: caller guarantees slab_idx is in bounds and the entry is Some.
-        unsafe {
-            *self
-                .arena_slot_map
-                .get_unchecked(slab_idx.as_usize())
-                .as_ref()
-                .unwrap_unchecked()
-        }
-    }
-
     pub fn is_registered(&self) -> bool {
         self.registered
     }

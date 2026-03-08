@@ -155,14 +155,15 @@ impl ArenaManager {
         removed
     }
 
-    /// Reference to the current writable arena.
+    /// Returns a reference to the arena at `write_idx` without bounds or
+    /// Option checks.
     ///
     /// # Safety justification
     /// `write_idx` always points to a valid, `Some` slab entry. This invariant
     /// is maintained by `new()` (sets `write_idx` to the first arena) and
     /// `rotate()` (secures the next arena before updating `write_idx`).
     #[inline(always)]
-    pub fn current_arena(&self) -> &Arena {
+    fn write_arena(&self) -> &Arena {
         // SAFETY: write_idx is always a valid index into a Some slot.
         // See safety justification above.
         unsafe {
@@ -171,6 +172,12 @@ impl ArenaManager {
                 .as_ref()
                 .unwrap_unchecked()
         }
+    }
+
+    /// Reference to the current writable arena.
+    #[inline(always)]
+    pub fn current_arena(&self) -> &Arena {
+        self.write_arena()
     }
 
     /// Slab index of the current writable arena.
@@ -185,14 +192,7 @@ impl ArenaManager {
     /// `current_arena_idx()` separately in the hot lease path.
     #[inline(always)]
     pub fn current_arena_with_idx(&self) -> (&Arena, ArenaIdx) {
-        // SAFETY: same invariant as current_arena().
-        let arena = unsafe {
-            self.arenas
-                .get_unchecked(self.write_idx.as_usize())
-                .as_ref()
-                .unwrap_unchecked()
-        };
-        (arena, self.write_idx)
+        (self.write_arena(), self.write_idx)
     }
 
     /// Look up an arena by slab index.
@@ -537,6 +537,59 @@ mod tests {
         let collected = mgr.collect();
         assert_eq!(collected, 2);
         assert_eq!(mgr.draining_count(), 0);
+    }
+
+    /// Helper: assert the unsafe invariant that `arenas[write_idx]` is `Some`.
+    fn assert_write_idx_valid(mgr: &ArenaManager) {
+        let idx = mgr.write_idx.as_usize();
+        assert!(
+            idx < mgr.arenas.len() && mgr.arenas[idx].is_some(),
+            "INVARIANT VIOLATED: arenas[write_idx={idx}] is not a valid Some entry"
+        );
+    }
+
+    #[test]
+    fn write_idx_invariant_after_new() {
+        let mgr = ArenaManager::new(&test_config()).unwrap();
+        assert_write_idx_valid(&mgr);
+    }
+
+    #[test]
+    fn write_idx_invariant_after_rotate() {
+        let mut mgr = ArenaManager::new(&test_config()).unwrap();
+        for _ in 0..10 {
+            mgr.rotate().unwrap();
+            assert_write_idx_valid(&mgr);
+        }
+    }
+
+    #[test]
+    fn write_idx_invariant_after_collect() {
+        let mut mgr = ArenaManager::new(&test_config()).unwrap();
+        mgr.rotate().unwrap();
+        mgr.rotate().unwrap();
+        mgr.collect();
+        assert_write_idx_valid(&mgr);
+    }
+
+    #[test]
+    fn write_idx_invariant_after_shrink() {
+        let config = PoolConfig {
+            arena_size: 4096,
+            initial_arenas: 1,
+            max_free_arenas: 0,
+            max_total_arenas: 0,
+            registration_slots: 32,
+            page_size: 4096,
+        };
+        let mut mgr = ArenaManager::new(&config).unwrap();
+        // Rotate several times to accumulate arenas, then collect and shrink.
+        for _ in 0..4 {
+            mgr.rotate().unwrap();
+        }
+        mgr.collect();
+        mgr.shrink();
+        assert_write_idx_valid(&mgr);
     }
 
     #[test]
