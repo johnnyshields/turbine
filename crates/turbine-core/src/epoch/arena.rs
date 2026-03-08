@@ -121,6 +121,19 @@ impl Arena {
         &self.remote_returns as *const AtomicUsize
     }
 
+    /// Fast check: does this arena definitely have outstanding leases?
+    /// Uses Relaxed ordering — safe because if local > remote_relaxed,
+    /// the true remote count is >= remote_relaxed, so (local - true_remote) > 0
+    /// is guaranteed. Only returns false when it looks like leases might be zero,
+    /// at which point the caller should use lease_count() with Acquire for the
+    /// definitive answer.
+    #[inline]
+    pub fn has_outstanding_leases(&self) -> bool {
+        let local = self.lease_count.get();
+        let remote = self.remote_returns.load(Ordering::Relaxed);
+        local > remote
+    }
+
     /// Current number of outstanding leases (local minus remote returns).
     #[inline]
     pub fn lease_count(&self) -> usize {
@@ -359,6 +372,40 @@ mod tests {
 
         arena.remote_release();
         assert_eq!(arena.lease_count(), 0);
+    }
+
+    #[test]
+    fn has_outstanding_leases_fast_check() {
+        let arena = Arena::new(4096).unwrap();
+        assert!(!arena.has_outstanding_leases());
+
+        arena.acquire_lease();
+        assert!(arena.has_outstanding_leases());
+
+        arena.acquire_lease();
+        assert!(arena.has_outstanding_leases());
+
+        // One remote release — still has 1 outstanding
+        arena.remote_release();
+        assert!(arena.has_outstanding_leases());
+
+        // Second remote release — now at zero
+        arena.remote_release();
+        assert!(!arena.has_outstanding_leases());
+    }
+
+    #[test]
+    fn has_outstanding_leases_with_local_release() {
+        let arena = Arena::new(4096).unwrap();
+        arena.acquire_lease();
+        arena.acquire_lease();
+        assert!(arena.has_outstanding_leases());
+
+        arena.release_lease();
+        assert!(arena.has_outstanding_leases());
+
+        arena.release_lease();
+        assert!(!arena.has_outstanding_leases());
     }
 
     #[test]

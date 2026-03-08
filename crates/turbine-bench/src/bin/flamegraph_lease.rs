@@ -24,6 +24,7 @@ fn main() {
         ..Default::default()
     };
     let pool = IouringBufferPool::new(config, NoopHooks).unwrap();
+    pool.pre_register_slots();
 
     // Warm up
     for _ in 0..1_000 {

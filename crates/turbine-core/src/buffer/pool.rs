@@ -191,6 +191,20 @@ impl<H: BufferPinHook + EpochObserver> IouringBufferPool<H> {
         self.reg_mut().unregister(&ring.submitter())
     }
 
+    /// Pre-populate arena slot mappings without io_uring registration.
+    ///
+    /// This assigns SlotIds to all live arenas so that `lease()` takes the
+    /// fast `slot_for_arena` path instead of `slot_missing_fallback`.
+    /// Useful for benchmarks and tests that don't have an io_uring ring.
+    pub fn pre_register_slots(&self) {
+        let reg = self.reg_mut();
+        for (idx, _) in self.mgr().live_arenas() {
+            if reg.slot_for_arena(idx).is_none() {
+                let _ = reg.register_arena(idx);
+            }
+        }
+    }
+
     /// The current epoch number.
     pub fn epoch(&self) -> u64 {
         self.mgr().epoch()
@@ -418,6 +432,20 @@ mod tests {
 
         // Now collect_epoch succeeds — atomic remote_release crossed threads.
         pool.collect_epoch(epoch).unwrap();
+    }
+
+    #[test]
+    fn pre_register_slots_populates_map() {
+        let pool = test_pool();
+        pool.pre_register_slots();
+
+        // After pre-registration, lease should get a non-zero slot
+        // (slot 0 is also valid, but all arenas should have slots assigned)
+        let buf = pool.lease(64).unwrap();
+        // The key check: slot_for_arena returns Some for the current arena
+        let arena_idx = pool.mgr().current_arena_idx();
+        assert!(pool.reg().slot_for_arena(arena_idx).is_some());
+        drop(buf);
     }
 
     /// Compile-time assertion that IouringBufferPool is !Send.

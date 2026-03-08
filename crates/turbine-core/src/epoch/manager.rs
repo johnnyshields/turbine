@@ -98,7 +98,6 @@ impl ArenaManager {
             .as_ref()
             .expect("write arena missing");
         current.set_state(ArenaState::Retired);
-        current.advise_free_unused(self.page_size);
         self.draining.push(self.write_idx);
 
         // Prepare the new writable arena.
@@ -126,15 +125,22 @@ impl ArenaManager {
         let mut collected = 0;
         let arenas = &self.arenas;
         let free_pool = &mut self.free_pool;
+        let page_size = self.page_size;
         self.draining.retain(|&idx| {
             let arena = arenas[idx.as_usize()].as_ref().expect("draining arena missing");
+            // Fast path: skip Acquire barrier when leases are clearly outstanding
+            if arena.has_outstanding_leases() {
+                return true; // keep in draining
+            }
+            // Slow path: Acquire-ordered check for definitive answer
             if arena.lease_count() == 0 {
+                arena.advise_free_unused(page_size);
                 arena.set_state(ArenaState::Collected);
                 free_pool.push(idx);
                 collected += 1;
-                false // remove from draining
+                false
             } else {
-                true // keep in draining
+                true
             }
         });
         collected

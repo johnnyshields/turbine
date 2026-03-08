@@ -59,6 +59,7 @@ fn main() {
         ..Default::default()
     };
     let pool = IouringBufferPool::new(config, NoopHooks).unwrap();
+    pool.pre_register_slots();
 
     let (tx, rx) = bounded::<SendableBuffer>(64);
 

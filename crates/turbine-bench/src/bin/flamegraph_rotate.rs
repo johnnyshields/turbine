@@ -17,8 +17,8 @@ fn main() {
     let output_path: String =
         env_or("FLAMEGRAPH_OUTPUT", "target/flamegraph-rotate.svg".to_string());
 
-    // Small arena: fits ~4 buffers of buf_size, forcing constant rotation.
-    let arena_size = buf_size * 6; // ~4 usable after bump-allocator overhead
+    // Small arena: force frequent rotation. Round up to page alignment.
+    let arena_size = ((buf_size * 6) + 4095) & !4095;
     let config = PoolConfig {
         arena_size,
         initial_arenas: 3,
@@ -26,6 +26,7 @@ fn main() {
         ..Default::default()
     };
     let pool = IouringBufferPool::new(config, NoopHooks).unwrap();
+    pool.pre_register_slots();
 
     // Warm up: force a few rotations
     for _ in 0..20 {

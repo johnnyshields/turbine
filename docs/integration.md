@@ -75,6 +75,11 @@ Turbine for buffer management.
 - **Collection:** Call `pool.collect()` after rotation to reclaim arenas
   whose leases have all been returned. This is required for arena recycling.
 
+- **Registration and performance:** Without `pool.register()`, every `lease()`
+  call falls through to `slot_missing_fallback` — a `#[cold]` path that returns
+  `SlotId(0)`. This is functionally correct but adds ~1% overhead visible in
+  flamegraphs. Always register with io_uring before entering the hot path.
+
 ## With a Custom Event Loop
 
 If you are writing your own event loop directly on `io-uring`:

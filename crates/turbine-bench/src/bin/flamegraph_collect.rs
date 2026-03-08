@@ -51,6 +51,7 @@ fn main() {
         ..Default::default()
     };
     let pool = IouringBufferPool::new(config, NoopHooks).unwrap();
+    pool.pre_register_slots();
 
     // Build initial drain queue
     let mut held = build_drain_queue(&pool, buf_size, queue_depth);
